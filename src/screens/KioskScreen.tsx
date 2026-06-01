@@ -1035,16 +1035,18 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
       const prevEvent = activeScheduledEventRef.current;
 
       if (activeEvent && activeEvent.id !== prevEvent?.id) {
-        // New active event found
+        // New active event found — remount WebView to kill the previous session
+        // (audio/JS from the old page would otherwise continue running in the background)
         activeScheduledEventRef.current = activeEvent;
         setActiveScheduledEvent(activeEvent);
         setUrl(activeEvent.url);
+        setWebViewKey(k => k + 1);
         // In dashboard mode, switch from grid to webview for planner
         if (dashboardModeEnabled) {
           setDashboardShowGrid(false);
         }
       } else if (!activeEvent && prevEvent) {
-        // No active event, but there was one before
+        // No active event, but there was one before — remount WebView to kill the session
         activeScheduledEventRef.current = null;
         setActiveScheduledEvent(null);
         if (dashboardModeEnabled) {
@@ -1052,6 +1054,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
         } else if (!urlRotationEnabled || urlRotationList.length < 2) {
           // Restore base URL or let rotation take over
           setUrl(baseUrl);
+          setWebViewKey(k => k + 1);
         }
       }
     };
