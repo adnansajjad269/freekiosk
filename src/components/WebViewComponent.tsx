@@ -27,7 +27,7 @@ interface WebViewComponentProps {
   url: string;
   autoReload: boolean;
   keyboardMode?: string; // 'default', 'force_numeric', 'smart'
-  onUserInteraction?: (event?: { isTap?: boolean; x?: number; y?: number }) => void; // callback optionnel pour interaction utilisateur
+  onUserInteraction?: (event?: { isTap?: boolean; x?: number; y?: number; fromFallbackButton?: boolean }) => void; // callback optionnel pour interaction utilisateur
   jsToExecute?: string; // JavaScript code to execute from API
   onJsExecuted?: () => void; // callback when JS is executed
   showBackButton?: boolean; // Enable web navigation back button
@@ -84,6 +84,9 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
   const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const loadingTimeoutRef = useRef<any>(null);
+  // Last top-frame (main document) URL requested — used to distinguish a fatal
+  // main-page HTTP error from a harmless sub-resource error (favicon, analytics…).
+  const lastTopFrameUrlRef = useRef<string | null>(null);
 
   // Pre-compile URL filter patterns into RegExp for performance
   const compiledFilterPatterns = useMemo(() => {
@@ -686,11 +689,25 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
 
   const handleHttpError = (event: any): void => {
     const statusCode = event.nativeEvent.statusCode;
-    console.error('[FreeKiosk] HTTP Error:', statusCode, event.nativeEvent.url);
-    if (autoReload && statusCode >= 500) {
-      setError(true);
-      setLoading(false);
-      webViewRef.current?.injectJavaScript('window.location.href = "about:blank"; true;');
+    const failedUrl = event.nativeEvent.url;
+    console.error('[FreeKiosk] HTTP Error:', statusCode, failedUrl);
+
+    // Only treat the error as fatal when it comes from the main document.
+    // onReceivedHttpError also fires for sub-resources (images, scripts,
+    // favicons…); a 404 on those must not hijack an otherwise-working page.
+    if (failedUrl && lastTopFrameUrlRef.current && failedUrl !== lastTopFrameUrlRef.current) {
+      return;
+    }
+
+    // Show the error overlay (with the fallback settings button) for ANY main-page
+    // HTTP error code, regardless of autoReload — otherwise the user is stranded
+    // with no way back to settings when the page can't load (#180).
+    setError(true);
+    setLoading(false);
+    webViewRef.current?.injectJavaScript('window.location.href = "about:blank"; true;');
+
+    // Auto-retry only when the feature is enabled.
+    if (autoReload) {
       setTimeout(() => {
         setError(false);
         setLoading(true);
@@ -944,6 +961,12 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
             return false;
           }
 
+          // Remember the main-document navigation target so HTTP errors can be
+          // attributed to the main frame vs. a sub-resource (see handleHttpError).
+          if (request.isTopFrame) {
+            lastTopFrameUrlRef.current = request.url;
+          }
+
           return true;
         }}
 
@@ -1049,7 +1072,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
             activeOpacity={0.7}
             onPress={() => {
               if (onUserInteraction) {
-                onUserInteraction({ isTap: true, x: 0, y: 0 });
+                onUserInteraction({ isTap: true, x: 0, y: 0, fromFallbackButton: true });
               }
             }}
           >
@@ -1080,7 +1103,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
             activeOpacity={0.7}
             onPress={() => {
               if (onUserInteraction) {
-                onUserInteraction({ isTap: true, x: 0, y: 0 });
+                onUserInteraction({ isTap: true, x: 0, y: 0, fromFallbackButton: true });
               }
             }}
           >

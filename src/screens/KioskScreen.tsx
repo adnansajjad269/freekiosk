@@ -2042,12 +2042,19 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
     screenSchedulerWakeOnTouchRef.current = screenSchedulerWakeOnTouch;
   }, [screenSchedulerWakeOnTouch]);
 
-  const onUserInteraction = useCallback(async (event?: { isTap?: boolean; x?: number; y?: number }) => {
+  const onUserInteraction = useCallback(async (event?: { isTap?: boolean; x?: number; y?: number; fromFallbackButton?: boolean }) => {
+    // The fallback ⚙️ button (shown on the loading/error overlay when the page
+    // can't load) is an explicit "take me to settings" affordance — it must
+    // count toward the N-tap sequence in EVERY return mode, not just tap_anywhere (#180).
+    const isTapForSettings = (displayMode === 'webview' || displayMode === 'media_player')
+      && event?.isTap
+      && (returnMode === 'tap_anywhere' || event?.fromFallbackButton);
+
     // If in scheduled sleep and wake on touch is disabled, ignore user interaction
     // (except still allow N-tap for settings access)
     if (isScheduledSleepRef.current && !screenSchedulerWakeOnTouchRef.current) {
       // Still allow N-tap detection for PIN navigation even during scheduled sleep
-      if ((displayMode === 'webview' || displayMode === 'media_player') && event?.isTap && returnMode === 'tap_anywhere') {
+      if (isTapForSettings) {
         // Fall through to tap detection below
       } else {
         return;
@@ -2086,8 +2093,9 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
     }
 
     // N-tap detection for WebView/MediaPlayer mode - Only count dedicated 'tap' events from clicks
-    // In button mode: taps are handled by the button itself, not here
-    if ((displayMode === 'webview' || displayMode === 'media_player') && event?.isTap && returnMode === 'tap_anywhere') {
+    // In button mode: page taps are handled by the button itself, not here — but the
+    // fallback ⚙️ button (event.fromFallbackButton) always counts (see isTapForSettings).
+    if (isTapForSettings) {
       const now = Date.now();
       const tapX = event.x ?? 0;
       const tapY = event.y ?? 0;

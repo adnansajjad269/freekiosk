@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- 🔓 **Stuck in kiosk with no way back to settings when the page fails to load** (#180): In WebView mode the normal N-tap-to-settings gesture relies on JavaScript injected into the page, so when the page can't load (server down, Wi-Fi not yet up after a reboot, HTTP error) no taps were ever reported and the user was stranded. Two fixes: (1) the error overlay — with its fallback ⚙️ settings button — now appears for **any** main-document HTTP error code, regardless of the auto-reload setting (previously only for 5xx with auto-reload on), while sub-resource errors (favicons, scripts…) are correctly ignored; (2) the fallback ⚙️ button now counts toward the N-tap sequence in **every** return mode, not just "tap anywhere". The hardware Volume-Up ×5 shortcut remains the universal escape hatch.
+
 - 🩹 **`npm install` fails with "Failed to apply patch for package react-native-webview" on Windows** (#184): The repository only declared `* text=auto` in `.gitattributes`, so on Windows (with `core.autocrlf=true`) the `.patch` files were checked out with CRLF line endings on a fresh clone. patch-package 8 cannot parse CRLF patches and aborted `postinstall`, blocking development setup. Added a `*.patch text eol=lf` rule so patch files always keep LF line endings regardless of platform.
 
 - 🔍 **WebView zoom now scales the full page layout, not just text** (#188): The zoom setting previously used Android's `textZoom` which only scaled text size, causing card contents in Home Assistant dashboards to overflow their containers. Zoom now applies a CSS `zoom` property on the root element, scaling text, images, and layout containers uniformly.
