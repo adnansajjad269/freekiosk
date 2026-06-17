@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- 🩹 **`npm install` fails with "Failed to apply patch for package react-native-webview" on Windows** (#184): The repository only declared `* text=auto` in `.gitattributes`, so on Windows (with `core.autocrlf=true`) the `.patch` files were checked out with CRLF line endings on a fresh clone. patch-package 8 cannot parse CRLF patches and aborted `postinstall`, blocking development setup. Added a `*.patch text eol=lf` rule so patch files always keep LF line endings regardless of platform.
+
+- 🔍 **WebView zoom now scales the full page layout, not just text** (#188): The zoom setting previously used Android's `textZoom` which only scaled text size, causing card contents in Home Assistant dashboards to overflow their containers. Zoom now applies a CSS `zoom` property on the root element, scaling text, images, and layout containers uniformly.
+
+
 - 🔄 **Black screen / stuck on "Starting kiosk…" after reboot in Device Owner mode** (#176): Regression introduced in v1.2.20 (#172 fix). `setScreenCaptureDisabled(adminComponent, true)` was called between `setLockTaskPackages()` and `startLockTask()`. On Android 12+ devices (Lenovo, Samsung, KTC), this DPM call triggers a window policy change mid-sequence that disrupts lock task startup, leaving `BootLockActivity` stuck and `MainActivity` unable to take over. Fixed by moving `setScreenCaptureDisabled` to after `startLockTask()` so the lock task session is fully established first.
 
 - 💤 **Screensaver toggle resets to off after saving settings in External App mode** (#179): When display mode is set to External App, saving settings always forced `screensaverEnabled` to `false`, overwriting the user's choice. The screensaver save was correctly moved to apply to all display modes in a prior commit, but the old force-disable in the External App branch was never removed. Deleted the stale override.

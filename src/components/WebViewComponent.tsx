@@ -257,6 +257,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
     }
     window.__FREEKIOSK_INITIALIZED__ = true;
 
+    // Apply CSS zoom to scale the entire page layout (text + containers + images)
+    ${zoomLevel !== 100 ? `
+    document.documentElement.style.zoom = '${zoomLevel / 100}';
+    ` : ''}
+
     // Disable user zoom (pinch-to-zoom and double-tap zoom) when configured
     ${disableUserZoom ? `
     document.addEventListener('touchstart', function(e) {
@@ -969,7 +974,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
           }
         }}
 
-        textZoom={zoomLevel}
+        textZoom={100}
         scalesPageToFit={true}
         cacheEnabled={true}
         incognito={false}
