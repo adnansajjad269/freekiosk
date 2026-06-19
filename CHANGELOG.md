@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [1.2.20-beta.2] - 2026-06-19
+
 ### Fixed
 - 💥 **App crashes immediately on launch on cameraless x86 devices (BlissOS / Surface Go 2)** (#187): On devices whose camera service returns `null` from `CameraManager.getCameraIdList()` (e.g. BlissOS x86_64 desktop builds with no camera HAL), react-native-vision-camera's `CameraDevicesManager` threw a `NullPointerException` while building its availability callback. Because the module is instantiated eagerly during TurboModule initialization, this aborted the whole React instance and crashed the app on first launch — before any settings could load. Added a patch-package patch (`react-native-vision-camera+4.7.3.patch`) wrapping that call so a null camera list is treated as "no cameras" instead of crashing. Camera features are simply unavailable on such devices; the app now launches normally.
 
