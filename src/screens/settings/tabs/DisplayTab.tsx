@@ -402,6 +402,17 @@ const DisplayTab: React.FC<DisplayTabProps> = ({
             onValueChange={onScreensaverEnabledChange}
           />
 
+          {displayMode === 'external_app' && screensaverEnabled && (
+            <SettingsInfoBox variant="info">
+              <Text style={styles.infoText}>
+                ℹ️ In External App mode the system manages the screen. For the screensaver to
+                appear before the device turns the screen off on its own, set the Android screen
+                timeout to a value greater than or equal to the inactivity delay below — or to
+                "Never" (Android Settings → Display → Screen Timeout).
+              </Text>
+            </SettingsInfoBox>
+          )}
+
           {screensaverEnabled && (
             <>
               {/* Screensaver Style (dim / url / video) */}

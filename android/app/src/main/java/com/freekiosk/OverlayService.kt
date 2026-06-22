@@ -127,6 +127,25 @@ class OverlayService : Service() {
     // Cache Bluetooth isConnected Method to avoid reflection on every status bar update
     private var btIsConnectedMethod: java.lang.reflect.Method? = null
     private val tapHandler = Handler(Looper.getMainLooper())
+    // #190 — Native inactivity countdown for External App mode. React Native pauses JS
+    // timers while FreeKiosk is backgrounded behind the external app, so the JS inactivity
+    // timer never fires there. This native handler runs regardless and emits an event for
+    // JS to activate the screensaver. One-shot: after firing it disarms until JS re-arms.
+    private val inactivityHandler = Handler(Looper.getMainLooper())
+    private var inactivityEnabled = false
+    private var inactivityDelayMs = 0L
+    private val inactivityRunnable = Runnable {
+        DebugLog.d("OverlayService", "Native inactivity expired (${inactivityDelayMs}ms) — notifying JS")
+        inactivityEnabled = false // one-shot: JS re-arms on screensaver dismiss
+        try { KioskModule.sendEventFromNative("inactivityExpiredNative", null) } catch (e: Exception) {}
+    }
+
+    private fun armInactivityTimer() {
+        inactivityHandler.removeCallbacks(inactivityRunnable)
+        if (inactivityEnabled && inactivityDelayMs > 0) {
+            inactivityHandler.postDelayed(inactivityRunnable, inactivityDelayMs)
+        }
+    }
     private val statusUpdateHandler = Handler(Looper.getMainLooper())
     private var tapTimeout = 1500L // Default 1.5 seconds, will be overridden from intent
     private var requiredTaps = 5 // Default, will be overridden from intent
@@ -296,6 +315,16 @@ class OverlayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // When START_STICKY restarts the service after OOM kill, intent is null.
         // In that case, just ensure the overlay exists without full recreation.
+        // #190 — Inactivity config update (External App native screensaver trigger).
+        // Handled before the param-reading block below so it never resets tap/return params.
+        if (intent?.action == "UPDATE_INACTIVITY") {
+            inactivityEnabled = intent.getBooleanExtra("SCREENSAVER_INACTIVITY_ENABLED", false)
+            inactivityDelayMs = intent.getLongExtra("INACTIVITY_DELAY", 0L)
+            DebugLog.d("OverlayService", "Inactivity config: enabled=$inactivityEnabled, delay=${inactivityDelayMs}ms")
+            armInactivityTimer()
+            return START_STICKY
+        }
+
         if (intent == null) {
             DebugLog.d("OverlayService", "onStartCommand with null intent (service restarted by system)")
             val hasOverlayPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
@@ -980,6 +1009,9 @@ class OverlayService : Service() {
         // Notify FreeKiosk of user activity so the inactivity timer resets in External App mode
         try { KioskModule.sendEventFromNative("screensaverActivity", null) } catch (e: Exception) {}
 
+        // #190 — Reset the native inactivity countdown on any tap (External App mode).
+        armInactivityTimer()
+
         val now = System.currentTimeMillis()
 
         // First tap - record time and start timeout
@@ -1419,6 +1451,10 @@ class OverlayService : Service() {
         super.onDestroy()
         instance = null
         try {
+            // #190 — Stop the native inactivity countdown so it can't fire after teardown
+            inactivityEnabled = false
+            inactivityHandler.removeCallbacks(inactivityRunnable)
+
             // Stop MQTT watchdog
             stopMqttWatchdog()
 

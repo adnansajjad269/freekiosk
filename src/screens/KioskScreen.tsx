@@ -1913,29 +1913,39 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
     }
   };
 
+  // #190 — Body of the inactivity expiry: optional motion pre-check, then activate the
+  // screensaver. Extracted so it can be triggered by either the JS setTimeout (WebView/
+  // media modes) or the native inactivity event (External App mode, where RN freezes JS
+  // timers while FreeKiosk is backgrounded behind the external app).
+  const triggerScreensaverTimeout = useCallback(() => {
+    if (isScheduledSleep) return;
+    if (!(screensaverEnabled && inactivityEnabled)) return;
+    if (motionEnabled) {
+      console.log('[KioskScreen] Inactivity expired — starting motion pre-check');
+      setIsPreCheckingMotion(true);
+      // Pre-check window; if no motion is detected within it, activate the screensaver
+      preCheckTimerRef.current = setTimeout(() => {
+        console.log(`[KioskScreen] No motion detected after ${MOTION_PRE_CHECK_DELAY_MS}ms — activating screensaver`);
+        Keyboard.dismiss();
+        setIsScreensaverActive(true);
+        setIsPreCheckingMotion(false);
+      }, MOTION_PRE_CHECK_DELAY_MS);
+    } else {
+      Keyboard.dismiss();
+      setIsScreensaverActive(true);
+    }
+  }, [isScheduledSleep, screensaverEnabled, inactivityEnabled, motionEnabled]);
+
   const resetTimer = () => {
     clearTimer();
     // Don't start inactivity timer if screen is in scheduled sleep
     if (isScheduledSleep) return;
+    // External App mode: RN freezes JS timers while FreeKiosk is backgrounded, so the
+    // native countdown in OverlayService drives screensaver activation instead. #190
+    if (displayMode === 'external_app') return;
     if (screensaverEnabled && inactivityEnabled) {
       timerRef.current = setTimeout(() => {
-        // If motion detection is enabled, watch for movement before activating the screensaver
-        if (motionEnabled) {
-          console.log('[KioskScreen] Inactivity timer expired — starting motion pre-check');
-          setIsPreCheckingMotion(true);
-          // Start a pre-check window; if no motion is detected within it, activate the screensaver
-          preCheckTimerRef.current = setTimeout(() => {
-            console.log(`[KioskScreen] No motion detected after ${MOTION_PRE_CHECK_DELAY_MS}ms — activating screensaver`);
-            Keyboard.dismiss();
-            setIsScreensaverActive(true);
-            // Keep isPreCheckingMotion false since the screensaver takes over
-            setIsPreCheckingMotion(false);
-          }, MOTION_PRE_CHECK_DELAY_MS);
-        } else {
-          // No motion detection — activate directly
-          Keyboard.dismiss();
-          setIsScreensaverActive(true);
-        }
+        triggerScreensaverTimeout();
       }, inactivityDelay);
     }
   };
@@ -1952,6 +1962,32 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
     setIsPreCheckingMotion(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // only refs and stable setState — safe to omit
+
+  // #190 — External App mode: drive the inactivity countdown natively, since the JS
+  // setTimeout is frozen while FreeKiosk is backgrounded behind the external app. The
+  // native timer (OverlayService) re-arms on every tap and emits `inactivityExpiredNative`.
+  // Re-armed whenever the screensaver is dismissed (isScreensaverActive → false); disarmed
+  // during the motion pre-check, while the screensaver is active, or during scheduled sleep
+  // so it can never double-fire. Only touches the overlay service in external_app mode.
+  useEffect(() => {
+    if (displayMode !== 'external_app') return;
+    const enabled =
+      screensaverEnabled && inactivityEnabled &&
+      !isScreensaverActive && !isPreCheckingMotion && !isScheduledSleep;
+    OverlayServiceModule.updateInactivityConfig?.(inactivityDelay, enabled).catch(() => {});
+  }, [displayMode, screensaverEnabled, inactivityEnabled, inactivityDelay, isScreensaverActive, isPreCheckingMotion, isScheduledSleep]);
+
+  // #190 — Native inactivity countdown expired (External App mode) → run the same
+  // screensaver-activation path the JS timer would have run.
+  useEffect(() => {
+    const emitter = new NativeEventEmitter(NativeModules.DeviceEventManagerModule);
+    const sub = emitter.addListener('inactivityExpiredNative', () => {
+      if (displayMode !== 'external_app') return;
+      console.log('[KioskScreen] Native inactivity event received — triggering screensaver');
+      triggerScreensaverTimeout();
+    });
+    return () => sub.remove();
+  }, [displayMode, triggerScreensaverTimeout]);
 
   // ==================== Inactivity Return to Home ====================
   // Simple approach: use a single ref for the "last user interaction" timestamp
