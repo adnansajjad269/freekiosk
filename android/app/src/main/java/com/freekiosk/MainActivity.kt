@@ -300,6 +300,38 @@ class MainActivity : ReactActivity() {
     }
   }
 
+  // Set when startLockTask() failed because the task was not yet in the foreground.
+  // We retry the lock task once the activity actually gains window focus (onWindowFocusChanged).
+  private var lockTaskPending = false
+
+  /**
+   * Calls startLockTask() defensively.
+   *
+   * startLockTask() throws IllegalArgumentException("Invalid task, not in foreground")
+   * when the task is not the foreground task at the moment of the call — which happens
+   * when checkAndStartLockTask() runs from onCreate() while MainActivity is still
+   * backgrounded (e.g. at boot, or the external-app-at-boot path that moves the task to
+   * back). That exception is NOT a SecurityException, so it used to escape the catch in
+   * startLockTaskIfPossible() and crash the app on launch. On that failure we flag the
+   * attempt as pending and retry once the activity gains window focus.
+   */
+  private fun tryStartLockTask(context: String) {
+    try {
+      startLockTask()
+      lockTaskPending = false
+      DebugLog.d("MainActivity", "Lock task started ($context)")
+    } catch (e: IllegalArgumentException) {
+      // "Invalid task, not in foreground" — defer until the activity is truly foregrounded.
+      lockTaskPending = true
+      DebugLog.errorProduction("MainActivity", "Lock task not in foreground yet ($context), will retry on focus: ${e.message}")
+    } catch (e: IllegalStateException) {
+      lockTaskPending = true
+      DebugLog.errorProduction("MainActivity", "Lock task not ready yet ($context), will retry on focus: ${e.message}")
+    } catch (e: Exception) {
+      DebugLog.errorProduction("MainActivity", "Lock task failed ($context): ${e.message}")
+    }
+  }
+
   private fun startLockTaskIfPossible() {
     if (devicePolicyManager.isDeviceOwnerApp(packageName)) {
       try {
@@ -339,25 +371,15 @@ class MainActivity : ReactActivity() {
         // Lancer Lock Task sur MainActivity
         // Avec la whitelist, l'utilisateur peut naviguer entre FreeKiosk et l'app externe
         // Mais ne peut PAS sortir vers d'autres apps, launcher, ou paramètres
-        startLockTask()
-        DebugLog.d("MainActivity", "Lock task started (Device Owner) with whitelist: $uniqueWhitelist")
+        tryStartLockTask("Device Owner, whitelist: $uniqueWhitelist")
       } catch (e: SecurityException) {
         DebugLog.errorProduction("MainActivity", "Device Owner lock task failed (admin invalid?): ${e.message}")
         // Fall back to screen pinning
-        try {
-          startLockTask()
-        } catch (e2: Exception) {
-          DebugLog.errorProduction("MainActivity", "Fallback screen pinning also failed: ${e2.message}")
-        }
+        tryStartLockTask("fallback screen pinning")
       }
     } else {
       // Mode non-Device Owner: Screen Pinning manuel (demande confirmation utilisateur)
-      try {
-        startLockTask()
-        DebugLog.d("MainActivity", "Lock task started (Screen Pinning mode - user confirmation required)")
-      } catch (e: Exception) {
-        DebugLog.errorProduction("MainActivity", "Failed to start lock task: ${e.message}")
-      }
+      tryStartLockTask("Screen Pinning mode - user confirmation required")
     }
   }
 
@@ -681,6 +703,13 @@ class MainActivity : ReactActivity() {
       // Cancel any pending hideSystemUI to avoid fighting with the system window
       hideSystemUIHandler.removeCallbacksAndMessages(null)
     } else {
+      // Retry a lock task that was deferred because the task wasn't in the foreground
+      // when checkAndStartLockTask() ran in onCreate(). Window focus gained is the most
+      // reliable signal that the activity is now truly foregrounded.
+      if (lockTaskPending) {
+        tryStartLockTask("onWindowFocusChanged retry")
+      }
+
       // If a print dialog was active, reset the flag now that focus has returned
       if (PrintModule.isPrintActive) {
         DebugLog.d("MainActivity", "Print dialog closed — resetting isPrintActive, deferring immersive mode")
@@ -1157,8 +1186,22 @@ class MainActivity : ReactActivity() {
     val configJson = intent.getStringExtra("config") // Full JSON config
     val mqttBroker = intent.getStringExtra("mqtt_broker_url")
 
-    // Skip if no config parameters
-    if (lockPackage == null && url == null && configJson == null && mqttBroker == null) return false
+    // Skip if no config parameters.
+    // Treat the intent as an ADB config command if ANY recognized extra is present — not
+    // just the "content" keys (lock_package / url / config / mqtt_broker_url). Previously an
+    // intent that set only e.g. REST API or MQTT options (plus the required pin) bailed out
+    // here and was silently ignored (#193). Keep this list in sync with the extras read below.
+    val adbConfigKeys = arrayOf(
+      "lock_package", "url", "pin", "config",
+      "kiosk_enabled", "auto_launch", "auto_start", "screensaver_enabled", "auto_relaunch",
+      "test_mode", "back_button_mode", "status_bar", "pin_mode",
+      "rest_api_enabled", "rest_api_port", "rest_api_key",
+      "mqtt_enabled", "mqtt_broker_url", "mqtt_port", "mqtt_username", "mqtt_password",
+      "mqtt_client_id", "mqtt_base_topic", "mqtt_discovery_prefix", "mqtt_status_interval",
+      "mqtt_allow_control", "mqtt_device_name",
+      "external_app_mode", "managed_apps"
+    )
+    if (adbConfigKeys.none { intent.hasExtra(it) }) return false
     
     android.util.Log.i("FreeKiosk-ADB", "ADB config received: lock_package=$lockPackage, url=$url, config=${configJson != null}")
     
