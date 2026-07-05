@@ -36,7 +36,7 @@ jobs:
           git fetch --tags upstream
           git checkout "${{ github.event.inputs.source_tag }}"
           # Apply it
-          git apply --verbose /tmp/battery-lock.patch
+          git apply --verbose --whitespace=nowarn /tmp/battery-lock.patch
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
 
       - name: Set up Java 17
