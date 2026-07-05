@@ -1,0 +1,445 @@
+diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+index 82c009e..86266a4 100644
+--- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+@@ -1077,6 +1077,18 @@ class MainActivity : ReactActivity() {
+     intent.getStringExtra("status_bar")?.let {
+       editor.putString("@kiosk_status_bar_enabled", it)
+     }
++
++    intent.getStringExtra("battery_lock_enabled")?.let {
++      editor.putString("@kiosk_battery_lock_enabled", it)
++    }
++
++    intent.getStringExtra("battery_lock_threshold")?.let {
++      editor.putString("@kiosk_battery_lock_threshold", it)
++    }
++
++    intent.getStringExtra("battery_lock_message")?.let {
++      editor.putString("@kiosk_battery_lock_message", org.json.JSONObject.quote(it))
++    }
+     
+     intent.getStringExtra("rest_api_enabled")?.let {
+       editor.putString("@kiosk_rest_api_enabled", it)
+@@ -1364,7 +1376,11 @@ class MainActivity : ReactActivity() {
+       "mqtt_allow_control" to "@kiosk_mqtt_allow_control",
+       "mqtt_device_name" to "@kiosk_mqtt_device_name",
+       // Multi-app
+-      "external_app_mode" to "@kiosk_external_app_mode"
++      "external_app_mode" to "@kiosk_external_app_mode",
++      // Battery lock
++      "battery_lock_enabled" to "@kiosk_battery_lock_enabled",
++      "battery_lock_threshold" to "@kiosk_battery_lock_threshold",
++      "battery_lock_message" to "@kiosk_battery_lock_message"
+     )
+     
+     for ((jsonKey, storageKey) in keyMapping) {
+diff --git a/src/components/BatteryLockOverlay.tsx b/src/components/BatteryLockOverlay.tsx
+new file mode 100644
+index 0000000..6d5f08c
+--- /dev/null
++++ b/src/components/BatteryLockOverlay.tsx
+@@ -0,0 +1,182 @@
++/**
++ * BatteryLockOverlay.tsx
++ * Full-screen blocking overlay shown when battery drops below a configured
++ * threshold while not charging. Self-contained: reads its own settings from
++ * storage and polls battery state via SystemInfoModule.
++ *
++ * Unlock conditions (hysteresis to avoid flapping at the threshold):
++ *  - charger connected, OR
++ *  - battery level >= threshold + RESUME_HYSTERESIS
++ */
++
++import React, { useState, useEffect, useRef } from 'react';
++import {
++  Modal,
++  View,
++  Text,
++  StyleSheet,
++  NativeModules,
++  AppState,
++} from 'react-native';
++import { StorageService } from '../utils/storage';
++
++const { SystemInfoModule } = NativeModules;
++
++const POLL_INTERVAL_MS = 15000;
++const RESUME_HYSTERESIS = 3; // unlock at threshold + 3% when discharging
++
++const BatteryLockOverlay: React.FC = () => {
++  const [locked, setLocked] = useState(false);
++  const [level, setLevel] = useState<number | null>(null);
++  const [charging, setCharging] = useState(false);
++  const [message, setMessage] = useState('');
++  const settingsRef = useRef({ enabled: false, threshold: 5 });
++  const lockedRef = useRef(false);
++
++  useEffect(() => {
++    let mounted = true;
++    let interval: ReturnType<typeof setInterval> | null = null;
++
++    const check = async () => {
++      try {
++        // Re-read settings each cycle so ADB/MDM-pushed config changes
++        // take effect without an app restart.
++        const [enabled, threshold, msg] = await Promise.all([
++          StorageService.getBatteryLockEnabled(),
++          StorageService.getBatteryLockThreshold(),
++          StorageService.getBatteryLockMessage(),
++        ]);
++        settingsRef.current = { enabled, threshold };
++        if (mounted) {
++          setMessage(msg);
++        }
++
++        if (!enabled) {
++          if (mounted && lockedRef.current) {
++            lockedRef.current = false;
++            setLocked(false);
++          }
++          return;
++        }
++
++        if (!SystemInfoModule?.getSystemInfo) {
++          return;
++        }
++        const info = await SystemInfoModule.getSystemInfo();
++        const batt = info?.battery;
++        if (!batt || typeof batt.level !== 'number') {
++          return;
++        }
++
++        const isCharging = !!batt.isCharging;
++        if (mounted) {
++          setLevel(batt.level);
++          setCharging(isCharging);
++        }
++
++        let shouldLock: boolean;
++        if (lockedRef.current) {
++          // Already locked: release on charger, or with hysteresis margin
++          shouldLock =
++            !isCharging && batt.level < threshold + RESUME_HYSTERESIS;
++        } else {
++          shouldLock = !isCharging && batt.level <= threshold;
++        }
++
++        if (mounted && shouldLock !== lockedRef.current) {
++          lockedRef.current = shouldLock;
++          setLocked(shouldLock);
++          console.log(
++            `[BatteryLock] ${shouldLock ? 'LOCKED' : 'released'} at ${
++              batt.level
++            }% (threshold ${threshold}%, charging=${isCharging})`,
++          );
++        }
++      } catch (e) {
++        console.warn('[BatteryLock] check error', e);
++      }
++    };
++
++    check();
++    interval = setInterval(check, POLL_INTERVAL_MS);
++
++    // Re-check immediately when app returns to foreground
++    const sub = AppState.addEventListener('change', (state) => {
++      if (state === 'active') {
++        check();
++      }
++    });
++
++    return () => {
++      mounted = false;
++      if (interval) {
++        clearInterval(interval);
++      }
++      sub.remove();
++    };
++  }, []);
++
++  if (!locked) {
++    return null;
++  }
++
++  return (
++    <Modal
++      visible
++      animationType="fade"
++      statusBarTranslucent
++      hardwareAccelerated
++      onRequestClose={() => {
++        /* not dismissible */
++      }}
++    >
++      <View style={styles.container}>
++        <Text style={styles.icon}>🪫</Text>
++        <Text style={styles.title}>Battery critically low</Text>
++        <Text style={styles.subtitle}>
++          {message && message.length > 0
++            ? message
++            : 'Please connect the charger to continue'}
++        </Text>
++        <Text style={styles.level}>
++          {level !== null ? `${Math.round(level)}%` : ''}
++          {charging ? '  ⚡ charging…' : ''}
++        </Text>
++      </View>
++    </Modal>
++  );
++};
++
++const styles = StyleSheet.create({
++  container: {
++    flex: 1,
++    backgroundColor: '#B00020',
++    alignItems: 'center',
++    justifyContent: 'center',
++    paddingHorizontal: 32,
++  },
++  icon: {
++    fontSize: 72,
++    marginBottom: 24,
++  },
++  title: {
++    color: '#FFFFFF',
++    fontSize: 28,
++    fontWeight: '700',
++    textAlign: 'center',
++    marginBottom: 12,
++  },
++  subtitle: {
++    color: '#FFD6DB',
++    fontSize: 18,
++    textAlign: 'center',
++    marginBottom: 32,
++  },
++  level: {
++    color: '#FFFFFF',
++    fontSize: 22,
++    fontWeight: '600',
++  },
++});
++
++export default BatteryLockOverlay;
+diff --git a/src/components/BatteryLockSection.tsx b/src/components/BatteryLockSection.tsx
+new file mode 100644
+index 0000000..6464911
+--- /dev/null
++++ b/src/components/BatteryLockSection.tsx
+@@ -0,0 +1,73 @@
++/**
++ * BatteryLockSection.tsx
++ * Settings section for the low-battery lock feature.
++ * Self-contained (reads/writes its own settings), mounted in AdvancedTab.
++ */
++
++import React, { useState, useEffect } from 'react';
++import SettingsSection from './settings/SettingsSection';
++import SettingsSwitch from './settings/SettingsSwitch';
++import SettingsInput from './settings/SettingsInput';
++import { StorageService } from '../utils/storage';
++
++export const BatteryLockSection: React.FC = () => {
++  const [enabled, setEnabled] = useState(false);
++  const [threshold, setThreshold] = useState('5');
++  const [message, setMessage] = useState('');
++
++  useEffect(() => {
++    (async () => {
++      setEnabled(await StorageService.getBatteryLockEnabled());
++      setThreshold(String(await StorageService.getBatteryLockThreshold()));
++      setMessage(await StorageService.getBatteryLockMessage());
++    })();
++  }, []);
++
++  const onEnabledChange = async (value: boolean) => {
++    setEnabled(value);
++    await StorageService.saveBatteryLockEnabled(value);
++  };
++
++  const onThresholdChange = async (text: string) => {
++    setThreshold(text);
++    const n = parseInt(text, 10);
++    if (!isNaN(n) && n >= 1 && n <= 90) {
++      await StorageService.saveBatteryLockThreshold(n);
++    }
++  };
++
++  const onMessageChange = async (text: string) => {
++    setMessage(text);
++    await StorageService.saveBatteryLockMessage(text);
++  };
++
++  return (
++    <SettingsSection title="Battery Lock">
++      <SettingsSwitch
++        label="Lock kiosk on low battery"
++        hint="Shows a full-screen recharge prompt when the battery drops below the threshold while not charging. Clears automatically when a charger is connected."
++        value={enabled}
++        onValueChange={onEnabledChange}
++      />
++      {enabled && (
++        <>
++          <SettingsInput
++            label="Threshold (%)"
++            hint="1–90. Lock triggers at or below this level."
++            value={threshold}
++            onChangeText={onThresholdChange}
++            placeholder="5"
++            keyboardType="numeric"
++          />
++          <SettingsInput
++            label="Custom message (optional)"
++            hint="Shown on the lock screen. Leave empty for the default."
++            value={message}
++            onChangeText={onMessageChange}
++            placeholder="Please connect the charger to continue"
++          />
++        </>
++      )}
++    </SettingsSection>
++  );
++};
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index bf878c1..db609e8 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -9,6 +9,7 @@ import MediaPlayerComponent from '../components/MediaPlayerComponent';
+ import StatusBar from '../components/StatusBar';
+ import MotionDetector from '../components/MotionDetector';
+ import ExternalAppOverlay from '../components/ExternalAppOverlay';
++import BatteryLockOverlay from '../components/BatteryLockOverlay';
+ import { StorageService } from '../utils/storage';
+ import { saveSecurePin, saveSecureMqttPassword, getSecureBasicAuthPassword } from '../utils/secureStorage';
+ import KioskModule from '../utils/KioskModule';
+@@ -2609,6 +2610,9 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+           onPress={screenSchedulerWakeOnTouch ? onScreensaverTap : undefined}
+         />
+       )}
++
++      {/* Low-battery lock overlay (renders as a Modal above everything) */}
++      <BatteryLockOverlay />
+     </View>
+   );
+ };
+diff --git a/src/screens/settings/tabs/AdvancedTab.tsx b/src/screens/settings/tabs/AdvancedTab.tsx
+index 20ec743..a81e858 100644
+--- a/src/screens/settings/tabs/AdvancedTab.tsx
++++ b/src/screens/settings/tabs/AdvancedTab.tsx
+@@ -13,6 +13,7 @@ import {
+ } from '../../../components/settings';
+ import { ApiSettingsSection } from '../../../components/ApiSettingsSection';
+ import { MqttSettingsSection } from '../../../components/MqttSettingsSection';
++import { BatteryLockSection } from '../../../components/BatteryLockSection';
+ import { CertificateInfo } from '../../../utils/CertificateModule';
+ import AccessibilityModule from '../../../utils/AccessibilityModule';
+ import { Colors, Spacing, Typography } from '../../../theme';
+@@ -233,6 +234,9 @@ const AdvancedTab: React.FC<AdvancedTabProps> = ({
+       {/* MQTT - Home Assistant Integration */}
+       <MqttSettingsSection />
+ 
++      {/* Low-battery kiosk lock */}
++      <BatteryLockSection />
++
+       {/* Accessibility Service - Hidden in Play Store builds (BIND_ACCESSIBILITY_SERVICE policy) */}
+       {enableSelfUpdate && (
+       <SettingsSection title="Accessibility Service" icon="keyboard-outline">
+diff --git a/src/utils/BackupService.ts b/src/utils/BackupService.ts
+index 7d0a9e5..c9d0ac0 100644
+--- a/src/utils/BackupService.ts
++++ b/src/utils/BackupService.ts
+@@ -11,6 +11,9 @@ import { hasSecurePin, getSecureApiKey, saveSecureApiKey, getSecureMqttPassword,
+ // All storage keys to backup
+ const BACKUP_KEYS = [
+   '@kiosk_url',
++  '@kiosk_battery_lock_enabled',
++  '@kiosk_battery_lock_threshold',
++  '@kiosk_battery_lock_message',
+   '@kiosk_auto_reload',
+   '@kiosk_enabled',
+   '@kiosk_auto_launch',
+diff --git a/src/utils/storage.ts b/src/utils/storage.ts
+index c58ee14..2e1d720 100644
+--- a/src/utils/storage.ts
++++ b/src/utils/storage.ts
+@@ -40,6 +40,10 @@ const KEYS = {
+   STATUS_BAR_SHOW_VOLUME: '@kiosk_status_bar_show_volume',
+   STATUS_BAR_SHOW_TIME: '@kiosk_status_bar_show_time',
+   STATUS_BAR_THEME: '@kiosk_status_bar_theme',
++  // Battery lock (low-battery kiosk freeze)
++  BATTERY_LOCK_ENABLED: '@kiosk_battery_lock_enabled',
++  BATTERY_LOCK_THRESHOLD: '@kiosk_battery_lock_threshold',
++  BATTERY_LOCK_MESSAGE: '@kiosk_battery_lock_message',
+   EXTERNAL_APP_TEST_MODE: '@kiosk_external_app_test_mode',
+   BACK_BUTTON_MODE: '@kiosk_back_button_mode',
+   BACK_BUTTON_TIMER_DELAY: '@kiosk_back_button_timer_delay',
+@@ -1015,6 +1019,68 @@ export const StorageService = {
+     }
+   },
+ 
++  // BATTERY LOCK (low-battery kiosk freeze)
++  saveBatteryLockEnabled: async (value: boolean): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.BATTERY_LOCK_ENABLED, JSON.stringify(value));
++    } catch (error) {
++      console.error('Error saving battery lock enabled:', error);
++    }
++  },
++
++  getBatteryLockEnabled: async (): Promise<boolean> => {
++    try {
++      const value = await AsyncStorage.getItem(KEYS.BATTERY_LOCK_ENABLED);
++      return value === null ? false : JSON.parse(value) === true || JSON.parse(value) === 'true';
++    } catch (error) {
++      console.error('Error getting battery lock enabled:', error);
++      return false;
++    }
++  },
++
++  saveBatteryLockThreshold: async (value: number): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.BATTERY_LOCK_THRESHOLD, JSON.stringify(value));
++    } catch (error) {
++      console.error('Error saving battery lock threshold:', error);
++    }
++  },
++
++  getBatteryLockThreshold: async (): Promise<number> => {
++    try {
++      const value = await AsyncStorage.getItem(KEYS.BATTERY_LOCK_THRESHOLD);
++      if (value === null) { return 5; }
++      const n = parseInt(JSON.parse(value), 10);
++      return isNaN(n) ? 5 : Math.min(90, Math.max(1, n));
++    } catch (error) {
++      console.error('Error getting battery lock threshold:', error);
++      return 5;
++    }
++  },
++
++  saveBatteryLockMessage: async (value: string): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.BATTERY_LOCK_MESSAGE, JSON.stringify(value));
++    } catch (error) {
++      console.error('Error saving battery lock message:', error);
++    }
++  },
++
++  getBatteryLockMessage: async (): Promise<string> => {
++    try {
++      const value = await AsyncStorage.getItem(KEYS.BATTERY_LOCK_MESSAGE);
++      if (value === null) { return ''; }
++      try {
++        return String(JSON.parse(value));
++      } catch {
++        return value; // raw (unquoted) string written by native config path
++      }
++    } catch (error) {
++      console.error('Error getting battery lock message:', error);
++      return '';
++    }
++  },
++
+   saveStatusBarShowWifi: async (value: boolean): Promise<void> => {
+     try {
+       await AsyncStorage.setItem(KEYS.STATUS_BAR_SHOW_WIFI, JSON.stringify(value));
