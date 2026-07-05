@@ -34,6 +34,37 @@ index 82c009e..86266a4 100644
      )
      
      for ((jsonKey, storageKey) in keyMapping) {
+diff --git a/patches/react-native-webview+13.16.0.patch b/patches/react-native-webview+13.16.0.patch
+index 9ceb0c5..b4a722c 100644
+--- a/patches/react-native-webview+13.16.0.patch
++++ b/patches/react-native-webview+13.16.0.patch
+@@ -295,7 +295,7 @@ index 0287e1c..1abee9d 100644
+      @Override
+      public boolean shouldOverrideUrlLoading(WebView view, String url) {
+          final RNCWebView rncWebView = (RNCWebView) view;
+-@@ -157,23 +302,15 @@ public class RNCWebViewClient extends WebViewClient {
++@@ -157,23 +302,36 @@ public class RNCWebViewClient extends WebViewClient {
+  
+ +    /**
+ +     * Returns true if the SSL error originates from the main frame rather than a sub-resource.
+@@ -342,7 +342,7 @@ index 0287e1c..1abee9d 100644
+          switch (code) {
+              case SslError.SSL_DATE_INVALID:
+                  description = "The date of the certificate is invalid";
+-@@ -200,24 +337,226 @@ public class RNCWebViewClient extends WebViewClient {
++@@ -200,24 +337,228 @@ public class RNCWebViewClient extends WebViewClient {
+  
+          description = descriptionPrefix + description;
+  
+@@ -369,7 +369,7 @@ index 0287e1c..1abee9d 100644
+ +            handler.proceed();
+ +            return;
+ +        }
+-
++ 
+ -        this.onReceivedError(
+ +        // IMPORTANT: Only show dialog for self-signed (SSL_UNTRUSTED) on the main frame.
+ +        // isMainFrameRequest() handles: null topWindowUrl (initial nav), exact match, and
 diff --git a/src/components/BatteryLockOverlay.tsx b/src/components/BatteryLockOverlay.tsx
 new file mode 100644
 index 0000000..6d5f08c
