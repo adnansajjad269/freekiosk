@@ -30,7 +30,10 @@ jobs:
           set -e
           # Save the patch (it only exists on the default branch, not in the tag)
           cp "${{ github.event.inputs.patch_file }}" /tmp/battery-lock.patch
-          # Switch the source tree to the exact release the patch targets
+          # Forks don't always carry the release tags, so pull them from the
+          # original FreeKiosk repo, then switch the source tree to that release.
+          git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
+          git fetch --tags upstream
           git checkout "${{ github.event.inputs.source_tag }}"
           # Apply it
           git apply --verbose /tmp/battery-lock.patch
