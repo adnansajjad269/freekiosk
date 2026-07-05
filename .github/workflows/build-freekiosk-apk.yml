@@ -74,7 +74,9 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > android/fleet.keystore
+            # build.gradle's signingConfig resolves storeFile relative to the
+            # app module (android/app/), so the keystore must live there.
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/fleet.keystore
             {
               echo "FREEKIOSK_UPLOAD_STORE_FILE=fleet.keystore"
               echo "FREEKIOSK_UPLOAD_STORE_PASSWORD=$KEYSTORE_PASSWORD"
