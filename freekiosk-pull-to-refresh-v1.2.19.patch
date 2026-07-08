@@ -1,0 +1,14 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index fcad9df..eebd76a 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -1025,6 +1025,9 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+ 
+         nestedScrollEnabled={true}
+ 
++        // Pull-to-refresh: swipe down from the top of the page to reload (Android SwipeRefreshLayout)
++        pullToRefreshEnabled={true}
++
+         mediaPlaybackRequiresUserAction={false}
+         allowsInlineMediaPlayback={true}
+ 
