@@ -37,6 +37,13 @@ jobs:
           git checkout "${{ github.event.inputs.source_tag }}"
           # Apply it
           git apply --verbose --whitespace=nowarn /tmp/battery-lock.patch
+          # Apply main-camera enforcement patch
+          cp "$GITHUB_WORKSPACE/freekiosk-main-camera-v1.2.19.patch" /tmp/main-camera.patch
+          git apply --3way --verbose --whitespace=nowarn /tmp/main-camera.patch
+
+          # Bump versionCode so Headwind pushes the update over the installed build
+          sed -E -i 's/versionCode [0-9]+/versionCode 41/' android/app/build.gradle
+          grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
 
       - name: Set up Java 17
