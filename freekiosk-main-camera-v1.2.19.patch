@@ -1,0 +1,130 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index fcad9df..809d2c6 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -18,6 +18,7 @@ import { WebView } from 'react-native-webview';
+ import type { WebViewErrorEvent, ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
+ import { useNavigation } from '@react-navigation/native';
+ import PrintModule from '../utils/PrintModule';
++import { CAMERA_SHIM_JS } from '../utils/cameraShim';
+ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+ import type { RootStackParamList } from '../navigation/AppNavigator';
+ 
+@@ -600,7 +601,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+     return '';
+   };
+ 
+-  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript();
++  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript() + CAMERA_SHIM_JS;
+ 
+   // Gestion des messages venant de la webview
+   const onMessageHandler = (event: any) => {
+@@ -856,6 +857,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+         javaScriptEnabled={true}
+         domStorageEnabled={true}
+         injectedJavaScript={combinedInjectedJavaScript}
++        injectedJavaScriptBeforeContentLoaded={CAMERA_SHIM_JS}
+ 
+         onMessage={onMessageHandler}
+ 
+diff --git a/src/utils/cameraShim.ts b/src/utils/cameraShim.ts
+new file mode 100644
+index 0000000..09273d2
+--- /dev/null
++++ b/src/utils/cameraShim.ts
+@@ -0,0 +1,95 @@
++/**
++ * cameraShim.ts
++ *
++ * Forces web pages inside the kiosk WebView to use the device's MAIN rear
++ * camera instead of letting Chrome/WebView pick a lens.
++ *
++ * Why: on multi-camera devices (e.g. Kyocera DuraForce Pro 2), a page that
++ * requests `facingMode: "environment"` may be handed the fixed-focus
++ * super-wide sensor (camera id 2, focal 1.53mm) instead of the autofocus
++ * main shooter (camera id 0, focal 3.519mm). This shim monkey-patches
++ * navigator.mediaDevices.getUserMedia before page scripts run and rewrites
++ * any rear/unspecified video request to `deviceId: { exact: <main rear> }`.
++ *
++ * Selection rule: among back-facing video inputs, pick the one whose label
++ * sorts lowest numerically. Android WebView labels cameras as
++ * "camera2 N, facing back", and the main rear sensor is camera 0 by
++ * platform convention, so the lowest index wins.
++ *
++ * Safety properties:
++ *  - Explicit front-camera requests (facingMode "user") pass through untouched.
++ *  - All other video constraints (resolution, torch, zoom) are preserved;
++ *    only facingMode is stripped and deviceId pinned.
++ *  - If enumeration fails or no back camera is found, the original request
++ *    is forwarded unchanged (fail-open).
++ *  - If the pinned request itself fails, it retries with the page's
++ *    original constraints (fail-open).
++ *  - Idempotent: guarded by window.__fkCamShim, safe to inject both
++ *    before-content-loaded and after load.
++ */
++
++export const CAMERA_SHIM_JS = `
++(function () {
++  if (window.__fkCamShim) { return; }
++  window.__fkCamShim = true;
++  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { return; }
++
++  var gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
++  var mainId = null;
++
++  function wantsFront(v) {
++    if (!v || typeof v !== 'object') { return false; }
++    var fm = v.facingMode;
++    if (!fm) { return false; }
++    var val = (typeof fm === 'object' && fm !== null) ? (fm.exact || fm.ideal) : fm;
++    if (Object.prototype.toString.call(val) === '[object Array]') { val = val[0]; }
++    return typeof val === 'string' && val.toLowerCase() === 'user';
++  }
++
++  function resolveMain() {
++    if (mainId) { return Promise.resolve(mainId); }
++    return navigator.mediaDevices.enumerateDevices().then(function (devs) {
++      var hasLabels = devs.some(function (d) { return d.label; });
++      if (hasLabels) { return devs; }
++      // Labels are empty until a camera permission is granted for the origin.
++      // Kiosk WebView auto-grants, so this priming call is instant/invisible.
++      return gum({ video: true }).then(function (t) {
++        t.getTracks().forEach(function (x) { x.stop(); });
++        return navigator.mediaDevices.enumerateDevices();
++      });
++    }).then(function (devs) {
++      var backs = devs.filter(function (d) {
++        return d.kind === 'videoinput' && /back|rear|environment/i.test(d.label);
++      }).sort(function (a, b) {
++        return a.label.localeCompare(b.label, undefined, { numeric: true });
++      });
++      // "camera2 0, facing back" sorts before "camera2 2, facing back"
++      if (backs.length) { mainId = backs[0].deviceId; }
++      return mainId;
++    }).catch(function () { return null; });
++  }
++
++  navigator.mediaDevices.getUserMedia = function (constraints) {
++    try {
++      if (constraints && constraints.video && !wantsFront(constraints.video)) {
++        return resolveMain().then(function (id) {
++          if (!id) { return gum(constraints); }
++          var v = (typeof constraints.video === 'object' && constraints.video !== null)
++            ? Object.assign({}, constraints.video)
++            : {};
++          delete v.facingMode;
++          v.deviceId = { exact: id };
++          var c = Object.assign({}, constraints);
++          c.video = v;
++          // If pinning fails for any reason, fall back to the page's own request.
++          return gum(c).catch(function () { return gum(constraints); });
++        });
++      }
++    } catch (e) { /* fail-open */ }
++    return gum(constraints);
++  };
++})();
++true;
++`;
++
++export default CAMERA_SHIM_JS;
