@@ -9,7 +9,7 @@ on:
     inputs:
       source_tag:
         description: "FreeKiosk release tag to build from"
-        default: "v1.2.20"
+        default: "v1.2.19"
         required: true
       patch_file:
         description: "Patch file name in the repo root"
