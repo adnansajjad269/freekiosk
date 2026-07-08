@@ -39,7 +39,7 @@ jobs:
           git apply --verbose --whitespace=nowarn /tmp/battery-lock.patch
           # Apply main-camera enforcement patch
           git show origin/main:freekiosk-pull-to-refresh-v1.2.19.patch > /tmp/ptr.patch
-          git apply --3way --verbose --whitespace=nowarn /tmp/main-camera.patch
+          git apply --3way --verbose --whitespace=nowarn /tmp/ptr.patch
 
           # Bump versionCode so Headwind pushes the update over the installed build
           sed -E -i 's/versionCode [0-9]+/versionCode 41/' android/app/build.gradle
