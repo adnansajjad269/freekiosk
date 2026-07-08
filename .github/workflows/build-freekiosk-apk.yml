@@ -9,7 +9,7 @@ on:
     inputs:
       source_tag:
         description: "FreeKiosk release tag to build from"
-        default: "v1.2.19"
+        default: "v1.2.20"
         required: true
       patch_file:
         description: "Patch file name in the repo root"
@@ -47,7 +47,9 @@ jobs:
           git apply --3way --verbose --whitespace=nowarn /tmp/refresh-button.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 42/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 43/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.20"/' android/app/build.gradle
+          grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
 
