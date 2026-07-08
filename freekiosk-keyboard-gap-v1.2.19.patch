@@ -1,8 +1,16 @@
 diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
-index 82c009e..fd759ad 100644
+index 82c009e..3477e76 100644
 --- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
 +++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
-@@ -28,6 +28,7 @@ import android.view.WindowInsets
+@@ -6,6 +6,7 @@ import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnable
+ import com.facebook.react.defaults.DefaultReactActivityDelegate
+ import android.os.Bundle
+ import android.view.View
++import android.view.ViewGroup
+ import android.view.WindowManager
+ import android.app.admin.DevicePolicyManager
+ import android.content.ComponentName
+@@ -28,6 +29,7 @@ import android.view.WindowInsets
  import android.view.WindowInsetsController
  import androidx.core.view.ViewCompat
  import androidx.core.view.WindowInsetsCompat
@@ -10,35 +18,61 @@ index 82c009e..fd759ad 100644
  import android.Manifest
  import androidx.core.app.ActivityCompat
  import androidx.core.content.ContextCompat
-@@ -109,13 +110,49 @@ class MainActivity : ReactActivity() {
+@@ -109,13 +111,78 @@ class MainActivity : ReactActivity() {
      // Adjust content padding when the soft keyboard appears.
      // In immersive/kiosk mode adjustResize is ignored, so we listen for IME insets
      // and manually add bottom padding so WebView form fields stay visible.
 +    //
-+    // Bug fix (#keyboard-gap): in immersive/sticky mode the *resting* inset dispatch
-+    // is sometimes not delivered when the IME hides, so the keyboard-height bottom
-+    // padding was left applied - a white gap the size of the keyboard that only
-+    // cleared on a window change (e.g. sleep/wake). Three-part fix:
-+    //   1. Explicitly reset padding to 0 when the IME is not visible.
-+    //   2. requestLayout() so the child WebView re-measures into the reclaimed space.
-+    //   3. Also drive padding from a WindowInsetsAnimation callback, so the value is
-+    //      corrected *during* the hide animation even if the final resting dispatch
-+    //      is late or missing; onEnd re-applies the true resting insets as a backstop.
++    // Bug fix v2 (#keyboard-gap): two distinct stale states occur after the IME
++    // hides in immersive/kiosk mode:
++    //   (a) the keyboard-height bottom padding is left applied (resting inset
++    //       dispatch not delivered), and
++    //   (b) Chromium inside the WebView keeps its layout viewport sized to
++    //       screen-minus-keyboard, leaving the bottom of the page blank even
++    //       when padding is correct. A device rotation fixes it because rotation
++    //       forces onSizeChanged -> full Chromium relayout.
++    // Fix: reset padding explicitly on hide (v1), and additionally perform a
++    // one-frame 1px height "jiggle" on the content child when the IME
++    // transitions visible -> hidden. The jiggle triggers onSizeChanged in the
++    // WebView (rotation-equivalent) which forces Chromium to rebuild its
++    // viewport and fires a window resize event into the page.
      val contentView = findViewById<View>(android.R.id.content)
++    var imeWasVisible = false
 +
-+    fun applyImePadding(view: View, insets: WindowInsetsCompat) {
++    fun forceContentRelayout() {
++      val target = (contentView as? ViewGroup)?.getChildAt(0) ?: contentView
++      val lp = target.layoutParams ?: return
++      val currentHeight = target.height
++      if (currentHeight <= 0) return
++      val originalLpHeight = lp.height
++      lp.height = currentHeight - 1
++      target.layoutParams = lp
++      target.post {
++        lp.height = originalLpHeight
++        target.layoutParams = lp
++        target.requestLayout()
++      }
++    }
++
++    fun applyImePadding(view: View, insets: WindowInsetsCompat, allowRelayoutKick: Boolean) {
 +      val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
 +      val bottom = if (imeVisible) insets.getInsets(WindowInsetsCompat.Type.ime()).bottom else 0
 +      if (view.paddingBottom != bottom) {
 +        view.setPadding(0, 0, 0, bottom)
 +        view.requestLayout()
 +      }
++      if (allowRelayoutKick) {
++        if (imeWasVisible && !imeVisible) {
++          view.post { forceContentRelayout() }
++        }
++        imeWasVisible = imeVisible
++      }
 +    }
 +
      ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
 -      val imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime())
 -      view.setPadding(0, 0, 0, imeInsets.bottom)
-+      applyImePadding(view, insets)
++      applyImePadding(view, insets, true)
        insets
      }
  
@@ -49,12 +83,15 @@ index 82c009e..fd759ad 100644
 +          insets: WindowInsetsCompat,
 +          runningAnimations: MutableList<WindowInsetsAnimationCompat>
 +        ): WindowInsetsCompat {
-+          applyImePadding(contentView, insets)
++          // No relayout kick during animation frames - padding only
++          applyImePadding(contentView, insets, false)
 +          return insets
 +        }
 +
 +        override fun onEnd(animation: WindowInsetsAnimationCompat) {
-+          ViewCompat.getRootWindowInsets(contentView)?.let { applyImePadding(contentView, it) }
++          ViewCompat.getRootWindowInsets(contentView)?.let {
++            applyImePadding(contentView, it, true)
++          }
 +        }
 +      }
 +    )
