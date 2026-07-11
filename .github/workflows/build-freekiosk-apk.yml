@@ -30,6 +30,11 @@ jobs:
           set -e
           # Save the patch (it only exists on the default branch, not in the tag)
           cp "${{ github.event.inputs.patch_file }}" /tmp/battery-lock.patch
+          # Same for the managed-config patch — copy it from the checked-out ref
+          # (branch or main) NOW, before switching the tree to the release tag,
+          # so the build works when dispatched from a feature branch too (the
+          # patch may not be on origin/main yet).
+          cp freekiosk-managed-config-v1.2.19.patch /tmp/managed-config.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -54,7 +59,8 @@ jobs:
           # post-battery-lock file. Do not reorder these git apply steps. If the
           # battery patch's storage.ts lines shift, regenerate this patch rather
           # than hand-editing it.
-          git show origin/main:freekiosk-managed-config-v1.2.19.patch > /tmp/managed-config.patch
+          # (patch already copied to /tmp above, before the tag checkout, so this
+          # works whether the build is dispatched from main or a feature branch.)
           git apply --3way --verbose --whitespace=nowarn /tmp/managed-config.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
