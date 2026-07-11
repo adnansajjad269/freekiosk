@@ -1543,10 +1543,10 @@ index dc1b7b6..c92afa9 100644
          screenOptions={{
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..56f1f15
+index 0000000..bb4fac4
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,379 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1783,8 +1783,11 @@ index 0000000..56f1f15
 +
 +  await saveSecurePin(pin);
 +
++  // Ack token: the admin-pushed kiosk_pin_label if present, otherwise a
++  // human-readable local "applied at" datetime (never raw epoch ms, and never
++  // anything derived from the PIN itself).
 +  const label = restrictions.kiosk_pin_label;
-+  const ackValue = label != null ? String(label) : String(Date.now());
++  const ackValue = label != null ? String(label) : formatLocalDateTime(new Date());
 +  try {
 +    await native?.reportCustom(2, ackValue);
 +    console.log(`[ManagedConfig] PIN updated, reported ack custom2=${ackValue}`);
@@ -1792,6 +1795,15 @@ index 0000000..56f1f15
 +    console.warn('[ManagedConfig] PIN ack (custom2) failed:', e);
 +  }
 +  return true;
++}
++
++/** Local time as "YYYY-MM-DD HH:mm" — sortable in the console's custom2 column. */
++function formatLocalDateTime(d: Date): string {
++  const pad = (n: number) => String(n).padStart(2, '0');
++  return (
++    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
++    `${pad(d.getHours())}:${pad(d.getMinutes())}`
++  );
 +}
 +
 +// ---- bulk apply (version-gated) --------------------------------------------
