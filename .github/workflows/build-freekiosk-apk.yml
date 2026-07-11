@@ -46,6 +46,17 @@ jobs:
           git show origin/main:freekiosk-refresh-button-v1.2.19.patch > /tmp/refresh-button.patch
           git apply --3way --verbose --whitespace=nowarn /tmp/refresh-button.patch
           git add -A
+          # Apply managed-config remote settings.
+          # ORDERING CONSTRAINT: this MUST come after the battery-lock patch —
+          # its apply table references StorageService battery-protection setters
+          # (saveBatteryLockThreshold etc.) that only exist once battery-lock has
+          # been applied, and its storage.ts hunk was diffed against the
+          # post-battery-lock file. Do not reorder these git apply steps. If the
+          # battery patch's storage.ts lines shift, regenerate this patch rather
+          # than hand-editing it.
+          git show origin/main:freekiosk-managed-config-v1.2.19.patch > /tmp/managed-config.patch
+          git apply --3way --verbose --whitespace=nowarn /tmp/managed-config.patch
+          git add -A
           # Bump versionCode so this build installs over the previous test build
           sed -E -i 's/versionCode [0-9]+/versionCode 43/' android/app/build.gradle
           sed -E -i 's/versionName "[^"]+"/versionName "1.2.20"/' android/app/build.gradle
