@@ -1543,10 +1543,10 @@ index dc1b7b6..c92afa9 100644
          screenOptions={{
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..2e623e5
+index 0000000..56f1f15
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,367 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1776,7 +1776,10 @@ index 0000000..2e623e5
 +
 +  const pin = String(rawPin).padStart(KIOSK_PIN_LENGTH, '0');
 +  const unchanged = await securePinMatches(pin);
-+  if (unchanged) return false;
++  if (unchanged) {
++    console.log('[ManagedConfig] kiosk_pin present but unchanged; skipping');
++    return false;
++  }
 +
 +  await saveSecurePin(pin);
 +
@@ -1784,6 +1787,7 @@ index 0000000..2e623e5
 +  const ackValue = label != null ? String(label) : String(Date.now());
 +  try {
 +    await native?.reportCustom(2, ackValue);
++    console.log(`[ManagedConfig] PIN updated, reported ack custom2=${ackValue}`);
 +  } catch (e) {
 +    console.warn('[ManagedConfig] PIN ack (custom2) failed:', e);
 +  }
@@ -1848,48 +1852,63 @@ index 0000000..2e623e5
 + * Top-level entry: apply an incoming restrictions bundle.
 + *
 + * `restrictions` is the whole App Restrictions object as read by the native
-+ * module: it contains the nested `managedConfig` object plus top-level sibling
-+ * keys (`kiosk_pin`, `kiosk_pin_label`).
++ * module. IMPORTANT: the Headwind launcher FLATTENS the `managedConfig`
++ * attribute's JSON keys directly into the top level of this bundle (see
++ * AppRestrictionUpdater.parseManagedConfig on the launcher side) — there is no
++ * nested `managedConfig` object on the device. So `config_version`, every
++ * setting key, and the PIN siblings (`kiosk_pin`, `kiosk_pin_label`) all live
++ * directly on `restrictions`.
 + */
 +export async function applyManagedConfig(
 +  restrictions: Record<string, unknown> | null | undefined,
 +  native: ManagedConfigNative | undefined,
 +): Promise<ApplyResult> {
 +  const result: ApplyResult = { pinChanged: false, bulkApplied: false };
-+  if (!restrictions) return result;
++  if (!restrictions) {
++    console.log('[ManagedConfig] no restrictions bundle; nothing to apply');
++    return result;
++  }
++  console.log('[ManagedConfig] restrictions received, keys=', Object.keys(restrictions));
 +
-+  // 1. PIN — ungated, every emission.
++  // 1. PIN — ungated, every emission (top-level kiosk_pin).
 +  try {
 +    result.pinChanged = await applyPin(restrictions, native);
 +  } catch (e) {
 +    console.warn('[ManagedConfig] applyPin failed:', e);
 +  }
 +
-+  // 2 + 3. Bulk config, gated on config_version.
-+  const managedConfig = restrictions.managedConfig;
-+  if (managedConfig && typeof managedConfig === 'object') {
-+    const mc = managedConfig as Record<string, unknown>;
-+    const incomingVersion =
-+      mc.config_version !== undefined && mc.config_version !== null
-+        ? String(mc.config_version)
-+        : undefined;
++  // 2 + 3. Bulk config, gated on config_version — read from the TOP LEVEL of
++  // the (flattened) restrictions bundle, not a nested object.
++  const incomingVersion =
++    restrictions.config_version !== undefined && restrictions.config_version !== null
++      ? String(restrictions.config_version)
++      : undefined;
 +
-+    if (incomingVersion === undefined) {
-+      console.warn('[ManagedConfig] managedConfig present without config_version; skipping bulk apply');
-+    } else {
-+      const lastVersion = await StorageService.getManagedConfigVersion();
-+      if (incomingVersion !== lastVersion) {
-+        const changed = await applyBulk(mc);
-+        await StorageService.saveManagedConfigVersion(incomingVersion);
-+        result.bulkApplied = changed;
-+        if (changed && native) {
-+          try {
-+            await native.reportCustom(1, incomingVersion);
-+          } catch (e) {
-+            console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
-+          }
-+        }
-+      }
++  if (incomingVersion === undefined) {
++    console.log('[ManagedConfig] no config_version present; skipping bulk apply (PIN-only or empty push)');
++    return result;
++  }
++
++  const lastVersion = await StorageService.getManagedConfigVersion();
++  console.log(`[ManagedConfig] config_version incoming=${incomingVersion} last=${lastVersion ?? '(none)'}`);
++  if (incomingVersion === lastVersion) {
++    console.log('[ManagedConfig] config_version unchanged; skipping bulk apply');
++    return result;
++  }
++
++  const changed = await applyBulk(restrictions);
++  await StorageService.saveManagedConfigVersion(incomingVersion);
++  result.bulkApplied = changed;
++  console.log(`[ManagedConfig] bulk apply done, changed=${changed}`);
++
++  // Ack on every version advance (even changed===false), so the console's
++  // custom1 column reliably reflects "device picked up version N".
++  if (native) {
++    try {
++      await native.reportCustom(1, incomingVersion);
++      console.log(`[ManagedConfig] reported config ack custom1=${incomingVersion}`);
++    } catch (e) {
++      console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
 +    }
 +  }
 +
