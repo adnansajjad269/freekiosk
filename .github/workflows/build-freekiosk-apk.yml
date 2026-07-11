@@ -58,8 +58,8 @@ jobs:
           git apply --3way --verbose --whitespace=nowarn /tmp/managed-config.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 43/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.20"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 44/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.21"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
