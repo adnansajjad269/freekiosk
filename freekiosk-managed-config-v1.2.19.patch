@@ -132,10 +132,10 @@ index a1a693a..26d3205 100644
      )
 diff --git a/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
 new file mode 100644
-index 0000000..2298bed
+index 0000000..1c9d2e2
 --- /dev/null
 +++ b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,305 @@
 +package com.freekiosk
 +
 +import android.content.BroadcastReceiver
@@ -157,6 +157,7 @@ index 0000000..2298bed
 +import com.facebook.react.bridge.WritableMap
 +import com.facebook.react.modules.core.DeviceEventManagerModule
 +import com.hmdm.HeadwindMDM
++import com.hmdm.MDMService
 +
 +/**
 + * Bridges Android Managed Configurations (App Restrictions) — pushed by the
@@ -168,6 +169,13 @@ index 0000000..2298bed
 + * JS API:
 + *   ManagedConfig.getConfig(): Promise<object>       current restrictions bundle
 + *   ManagedConfig.reportCustom(slot, value): Promise  ack via HeadwindMDM.setCustom
++ *   ManagedConfig.logRemote(level, message)           fire-and-forget; forwards to the
++ *                                                      launcher's remote-log pipeline via
++ *                                                      MDMService.Log (also logs locally).
++ *                                                      Only reaches the webconsole's Device
++ *                                                      Log tab if a server-side log rule
++ *                                                      matches com.freekiosk — otherwise a
++ *                                                      harmless local-only no-op.
 + *   event "managedConfigChanged": object              fired on every restrictions change
 + *
 + * See CLAUDE.md / the managed-config plan for the four schema conventions this
@@ -323,6 +331,31 @@ index 0000000..2298bed
 +            }
 +        } catch (e: Exception) {
 +            promise.reject("MANAGED_CONFIG_REPORT_ERROR", e)
++        }
++    }
++
++    /**
++     * Forward a log line to the Headwind launcher's remote-log pipeline
++     * (MDMService.Log — also logs locally under logcat tag [TAG]). Fire and
++     * forget: no promise, since a logging call should never block or fail
++     * JS-side just because the MDM bind isn't up yet. Whether this actually
++     * reaches the webconsole's Device Log tab depends entirely on a
++     * server-side log rule matching com.freekiosk (LogConfigTable.match on
++     * the launcher side) — without one it's a no-op beyond the local log.
++     */
++    @ReactMethod
++    fun logRemote(level: String, message: String) {
++        try {
++            when (level.uppercase()) {
++                "ERROR" -> MDMService.Log.e(TAG, message)
++                "WARNING", "WARN" -> MDMService.Log.w(TAG, message)
++                "INFO" -> MDMService.Log.i(TAG, message)
++                "DEBUG" -> MDMService.Log.d(TAG, message)
++                "VERBOSE" -> MDMService.Log.v(TAG, message)
++                else -> MDMService.Log.i(TAG, message)
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "logRemote failed: ${e.message}")
 +        }
 +    }
 +
@@ -1544,10 +1577,10 @@ index d00f06d..d8c4da5 100644
      // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..ac4dbf1
+index 0000000..ddbc232
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,523 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1596,9 +1629,18 @@ index 0000000..ac4dbf1
 +
 +const CLEAR_SENTINEL = '__CLEAR__';
 +
-+// Native module surface used for the acknowledgement side-channel.
++// Native module surface used for the acknowledgement side-channel and
++// optional remote-log forwarding (see logRemote below).
 +export interface ManagedConfigNative {
 +  reportCustom(slot: number, value: string): Promise<boolean>;
++  /**
++   * Fire-and-forget: forwards a log line to the Headwind launcher's remote-log
++   * pipeline (MDMService.Log on the native side), which ALSO logs locally.
++   * Whether it reaches the webconsole's Device Log tab depends on a
++   * server-side log rule matching com.freekiosk; without one this is a
++   * harmless no-op beyond the native-side local log.
++   */
++  logRemote?(level: 'INFO' | 'WARNING' | 'ERROR', message: string): void;
 +}
 +
 +// ---- coercion helpers ------------------------------------------------------
@@ -1625,6 +1667,49 @@ index 0000000..ac4dbf1
 +  if (!Array.isArray(v)) return undefined;
 +  if (v.length === 1 && v[0] === CLEAR_SENTINEL) return [];
 +  return v as T[];
++}
++
++/** Render a field value for a log line — compact, human-readable. */
++function formatValue(v: unknown): string {
++  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
++  try {
++    return JSON.stringify(v);
++  } catch {
++    return String(v);
++  }
++}
++
++/**
++ * Log a business-outcome message both locally (console) and — if the native
++ * module supports it — via logRemote(), so it can be forwarded to the
++ * Headwind launcher's remote-log pipeline and, if a server-side log rule
++ * matches, show up in the webconsole's Device Log tab.
++ */
++function logInfo(native: ManagedConfigNative | undefined, message: string) {
++  console.log(`[ManagedConfig] INFO: ${message}`);
++  try {
++    native?.logRemote?.('INFO', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(INFO) failed:', e);
++  }
++}
++
++function logWarn(native: ManagedConfigNative | undefined, message: string) {
++  console.warn(`[ManagedConfig] WARNING: ${message}`);
++  try {
++    native?.logRemote?.('WARNING', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(WARNING) failed:', e);
++  }
++}
++
++function logError(native: ManagedConfigNative | undefined, message: string) {
++  console.error(`[ManagedConfig] ERROR: ${message}`);
++  try {
++    native?.logRemote?.('ERROR', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(ERROR) failed:', e);
++  }
 +}
 +
 +// ---- apply table -----------------------------------------------------------
@@ -1830,13 +1915,13 @@ index 0000000..ac4dbf1
 +// ---- bulk apply (version-gated, per-field diffed) --------------------------
 +
 +type FieldOutcome =
-+  | { key: string; outcome: 'applied' }
-+  | { key: string; outcome: 'skipped' }
++  | { key: string; outcome: 'applied'; value: unknown }
++  | { key: string; outcome: 'skipped'; value: unknown }
 +  | { key: string; outcome: 'error'; reason: string };
 +
 +export interface BulkApplyResult {
-+  applied: string[];
-+  skipped: string[];
++  applied: { key: string; value: unknown }[];
++  skipped: { key: string; value: unknown }[];
 +  errors: { key: string; reason: string }[];
 +}
 +
@@ -1867,11 +1952,11 @@ index 0000000..ac4dbf1
 +    try {
 +      const current = await spec.get();
 +      if (equals(current, coerced.value)) {
-+        results.push({ key, outcome: 'skipped' });
++        results.push({ key, outcome: 'skipped', value: coerced.value });
 +        continue;
 +      }
 +      await spec.set(coerced.value);
-+      results.push({ key, outcome: 'applied' });
++      results.push({ key, outcome: 'applied', value: coerced.value });
 +    } catch (e) {
 +      results.push({ key, outcome: 'error', reason: e instanceof Error ? e.message : String(e) });
 +    }
@@ -1912,8 +1997,12 @@ index 0000000..ac4dbf1
 +  );
 +
 +  return {
-+    applied: results.filter((r): r is { key: string; outcome: 'applied' } => r.outcome === 'applied').map((r) => r.key),
-+    skipped: results.filter((r): r is { key: string; outcome: 'skipped' } => r.outcome === 'skipped').map((r) => r.key),
++    applied: results
++      .filter((r): r is { key: string; outcome: 'applied'; value: unknown } => r.outcome === 'applied')
++      .map((r) => ({ key: r.key, value: r.value })),
++    skipped: results
++      .filter((r): r is { key: string; outcome: 'skipped'; value: unknown } => r.outcome === 'skipped')
++      .map((r) => ({ key: r.key, value: r.value })),
 +    errors: results
 +      .filter((r): r is { key: string; outcome: 'error'; reason: string } => r.outcome === 'error')
 +      .map((r) => ({ key: r.key, reason: r.reason })),
@@ -1980,24 +2069,24 @@ index 0000000..ac4dbf1
 +
 +  const status: 'Success' | 'Error' = bulkResult.errors.length === 0 ? 'Success' : 'Error';
 +
-+  if (status === 'Success') {
-+    console.log(
-+      `[ManagedConfig] INFO: config #${incomingVersion} applied successfully. ` +
-+        `Applied [${bulkResult.applied.join(', ') || 'none'}]. ` +
-+        `Ignored, already matched device [${bulkResult.skipped.join(', ') || 'none'}].`,
-+    );
-+  } else {
-+    console.error(
-+      `[ManagedConfig] ERROR: config #${incomingVersion} had ${bulkResult.errors.length} field failure(s): ` +
-+        bulkResult.errors.map((e) => `${e.key} (${e.reason})`).join('; '),
-+    );
-+    if (bulkResult.applied.length > 0 || bulkResult.skipped.length > 0) {
-+      console.log(
-+        `[ManagedConfig] INFO: remaining fields still processed — ` +
-+          `applied [${bulkResult.applied.join(', ') || 'none'}], ` +
-+          `ignored, already matched device [${bulkResult.skipped.join(', ') || 'none'}].`,
-+      );
-+    }
++  // Three independent business-outcome logs, each only emitted when there's
++  // something to say, each carrying the actual field value (not just the key
++  // name) so the log line is self-sufficient without cross-referencing the
++  // push that caused it.
++  if (bulkResult.applied.length > 0) {
++    const appliedStr = bulkResult.applied.map((f) => `${f.key} = ${formatValue(f.value)}`).join(', ');
++    logInfo(native, `config #${incomingVersion} applied successfully. Applied [${appliedStr}]`);
++  }
++  if (bulkResult.skipped.length > 0) {
++    const skippedStr = bulkResult.skipped.map((f) => `${f.key} = ${formatValue(f.value)}`).join(', ');
++    logWarn(native, `config #${incomingVersion} — already matched device [${skippedStr}]`);
++  }
++  if (bulkResult.errors.length > 0) {
++    const errorStr = bulkResult.errors.map((e) => `${e.key} (${e.reason})`).join('; ');
++    logError(native, `config #${incomingVersion} had ${bulkResult.errors.length} field failure(s): ${errorStr}`);
++  }
++  if (bulkResult.applied.length === 0 && bulkResult.skipped.length === 0 && bulkResult.errors.length === 0) {
++    logInfo(native, `config #${incomingVersion} — no known fields present in payload`);
 +  }
 +
 +  // Ack on every version advance (even a fully-skipped, no-op push), so the
