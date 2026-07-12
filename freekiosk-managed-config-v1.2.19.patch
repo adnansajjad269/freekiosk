@@ -1439,14 +1439,14 @@ index 0000000..ff12a7c
 +}
 diff --git a/src/hooks/useManagedConfigSync.ts b/src/hooks/useManagedConfigSync.ts
 new file mode 100644
-index 0000000..8b9db94
+index 0000000..cf3fe29
 --- /dev/null
 +++ b/src/hooks/useManagedConfigSync.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,70 @@
 +import { useEffect } from 'react';
 +import { NativeModules, NativeEventEmitter } from 'react-native';
 +import { applyManagedConfig, ApplyResult, ManagedConfigNative } from '../utils/applyManagedConfig';
-+import { navigationRef } from '../navigation/AppNavigator';
++import { kioskScreenActionsRef } from '../utils/kioskScreenActions';
 +
 +const { ManagedConfig } = NativeModules as {
 +  ManagedConfig?: ManagedConfigNative & {
@@ -1456,18 +1456,20 @@ index 0000000..8b9db94
 +
 +/**
 + * App-root effect: applies Headwind MDM managed configuration (App
-+ * Restrictions) whenever it changes, and — only when safe — reloads the Kiosk
-+ * screen so a mid-session change is visible without a manual background/
-+ * foreground.
++ * Restrictions) whenever it changes, and refreshes the currently-mounted
++ * Kiosk screen live so a mid-session change is visible without a manual
++ * background/foreground or a reboot — no different from how PIN changes
++ * already take effect.
 + *
-+ * Reload guard (plan convention): a reload is a navigation.reset() to Kiosk,
-+ * which remounts KioskScreen/the WebView (a visible flash). It fires ONLY when:
-+ *   (a) the bulk config actually changed (never for a PIN-only change — the PIN
-+ *       is read fresh at PIN-entry time, nothing on screen is stale), AND
-+ *   (b) the current route is already Kiosk — otherwise a supervisor mid-edit in
-+ *       Settings/PinScreen would be ejected and lose unsaved work. Off Kiosk,
-+ *       the persisted values are picked up naturally by loadSettings() on the
-+ *       next focus.
++ * Reload trigger: calls kioskScreenActionsRef.current?.reloadSettings()
++ * directly (see src/utils/kioskScreenActions.ts) whenever the bulk config
++ * actually wrote at least one field — never for a PIN-only change (the PIN is
++ * read fresh at PIN-entry time; nothing on screen is stale), and never for a
++ * push where every field already matched the device (nothing to refresh).
++ * This is not a navigation action, so it never interrupts a supervisor
++ * mid-edit in Settings/PinScreen — it just quietly updates KioskScreen's
++ * state, which is visible instantly if Kiosk is in the foreground and
++ * otherwise already correct the next time the user navigates back to it.
 + */
 +export function useManagedConfigSync(): void {
 +  useEffect(() => {
@@ -1481,11 +1483,7 @@ index 0000000..8b9db94
 +
 +    const handleReload = (result: ApplyResult) => {
 +      if (!result.bulkApplied) return;
-+      if (!navigationRef.isReady()) return;
-+      const current = navigationRef.getCurrentRoute()?.name;
-+      if (current === 'Kiosk') {
-+        navigationRef.reset({ index: 0, routes: [{ name: 'Kiosk' }] });
-+      }
++      kioskScreenActionsRef.current?.reloadSettings();
 +    };
 +
 +    const apply = async (restrictions: Record<string, unknown>) => {
@@ -1515,38 +1513,41 @@ index 0000000..8b9db94
 +    };
 +  }, []);
 +}
-diff --git a/src/navigation/AppNavigator.tsx b/src/navigation/AppNavigator.tsx
-index dc1b7b6..c92afa9 100644
---- a/src/navigation/AppNavigator.tsx
-+++ b/src/navigation/AppNavigator.tsx
-@@ -1,5 +1,5 @@
- import React from 'react';
--import { NavigationContainer } from '@react-navigation/native';
-+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
- import { createNativeStackNavigator } from '@react-navigation/native-stack';
- import KioskScreen from '../screens/KioskScreen';
- import PinScreen from '../screens/PinScreen';
-@@ -16,9 +16,13 @@ export type RootStackParamList = {
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index d00f06d..d8c4da5 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -29,6 +29,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+ import type { RootStackParamList } from '../navigation/AppNavigator';
+ import Icon from '../components/Icon';
+ import { revokeSettingsAccess } from '../utils/authState';
++import { kioskScreenActionsRef } from '../utils/kioskScreenActions';
+ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
  
- const Stack = createNativeStackNavigator<RootStackParamList>();
+ const { HttpServerModule } = NativeModules;
+@@ -1876,6 +1877,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+     }
+   };
  
-+// Shared ref so app-root logic (e.g. the managed-config applier) can inspect
-+// the current route and drive navigation without being inside the tree.
-+export const navigationRef = createNavigationContainerRef<RootStackParamList>();
++  // Register a live-reload hook so managed-config pushes can refresh this
++  // screen's settings immediately (no navigation, no remount, no reboot) —
++  // see src/utils/kioskScreenActions.ts for why this is always safe to call.
++  useEffect(() => {
++    kioskScreenActionsRef.current = { reloadSettings: () => { loadSettings(); } };
++    return () => {
++      kioskScreenActionsRef.current = null;
++    };
++  });
 +
- const AppNavigator: React.FC = () => {
-   return (
--    <NavigationContainer>
-+    <NavigationContainer ref={navigationRef}>
-       <Stack.Navigator
-         initialRouteName="Kiosk"
-         screenOptions={{
+   const resetTimer = () => {
+     clearTimer();
+     // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..bb4fac4
+index 0000000..ac4dbf1
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,467 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1557,7 +1558,7 @@ index 0000000..bb4fac4
 + * arrive as top-level sibling attributes (per-device PIN rotation). The native
 + * ManagedConfigModule reads the whole restrictions bundle and hands it here.
 + *
-+ * Four schema conventions this file depends on (see the managed-config plan):
++ * Conventions this file depends on (see the managed-config plan):
 + *   1. Any number that can exceed 32-bit int range is sent as a JSON *string*
 + *      (the launcher's parseManagedConfig has a Long→int cast bug that would
 + *      otherwise silently drop the entire blob). Number fields here coerce with
@@ -1571,6 +1572,17 @@ index 0000000..bb4fac4
 + *   4. Object-array fields arrive as arrays of plain objects (native converts
 + *      the launcher's Parcelable[] of Bundles); they are passed straight to the
 + *      setters, which persist them as JSON.
++ *   5. The launcher FLATTENS the managedConfig attribute's JSON keys directly
++ *      into the top level of the restrictions bundle — there is no nested
++ *      `managedConfig` object on the device (see AppRestrictionUpdater on the
++ *      launcher side). `config_version` and every field key are read from the
++ *      top level of `restrictions`.
++ *   6. Every field is compared against its CURRENT on-device value (via the
++ *      matching StorageService getter) before writing. A value identical to
++ *      what's already stored is left alone ("skipped"), not rewritten — a
++ *      push is a list of desired values, not a list of commands, so one
++ *      field matching what's already there never blocks any other field in
++ *      the same push. See applyBulk()/applyFieldGroup().
 + */
 +
 +import { StorageService } from './storage';
@@ -1583,8 +1595,6 @@ index 0000000..bb4fac4
 +export const KIOSK_PIN_LENGTH = 6;
 +
 +const CLEAR_SENTINEL = '__CLEAR__';
-+
-+type Setter<T> = (value: T) => Promise<void>;
 +
 +// Native module surface used for the acknowledgement side-channel.
 +export interface ManagedConfigNative {
@@ -1619,142 +1629,153 @@ index 0000000..bb4fac4
 +
 +// ---- apply table -----------------------------------------------------------
 +//
-+// Grouped by value type to stay mechanical. Each entry maps a managedConfig
-+// JSON key to the StorageService setter it drives. Enum-valued setters are in
-+// the string group; the setters themselves validate/narrow.
++// Grouped by value type to stay mechanical. Each entry pairs a managedConfig
++// JSON key with the StorageService getter/setter that reads and writes it —
++// the getter is what makes per-field "is this actually different" diffing
++// possible (convention 6). Enum-valued fields live in the string group; the
++// setters themselves validate/narrow.
 +//
 +// Deliberately excluded (per plan): rest_api_key, mqtt_password,
 +// http_basic_auth_password (secrets stay GUI-only), and kiosk_pin (handled by
 +// applyPin, out-of-band from config_version gating).
 +
-+const BOOL_FIELDS: Record<string, Setter<boolean>> = {
-+  auto_reload: StorageService.saveAutoReload,
-+  kiosk_enabled: StorageService.saveKioskEnabled,
-+  auto_launch: StorageService.saveAutoLaunch,
-+  screensaver_enabled: StorageService.saveScreensaverEnabled,
-+  screensaver_video_loop: StorageService.saveScreensaverVideoLoop,
-+  screensaver_motion_enabled: StorageService.saveScreensaverMotionEnabled,
-+  auto_relaunch_app: StorageService.saveAutoRelaunchApp,
-+  overlay_button_visible: StorageService.saveOverlayButtonVisible,
-+  status_bar_enabled: StorageService.saveStatusBarEnabled,
-+  status_bar_on_overlay: StorageService.saveStatusBarOnOverlay,
-+  status_bar_on_return: StorageService.saveStatusBarOnReturn,
-+  status_bar_show_battery: StorageService.saveStatusBarShowBattery,
-+  status_bar_show_wifi: StorageService.saveStatusBarShowWifi,
-+  status_bar_show_bluetooth: StorageService.saveStatusBarShowBluetooth,
-+  status_bar_show_volume: StorageService.saveStatusBarShowVolume,
-+  status_bar_show_time: StorageService.saveStatusBarShowTime,
-+  battery_lock_enabled: StorageService.saveBatteryLockEnabled,
-+  url_rotation_enabled: StorageService.saveUrlRotationEnabled,
-+  url_planner_enabled: StorageService.saveUrlPlannerEnabled,
-+  rest_api_enabled: StorageService.saveRestApiEnabled,
-+  rest_api_allow_control: StorageService.saveRestApiAllowControl,
-+  allow_power_button: StorageService.saveAllowPowerButton,
-+  allow_notifications: StorageService.saveAllowNotifications,
-+  allow_system_info: StorageService.saveAllowSystemInfo,
-+  volume_up_5tap_enabled: StorageService.saveVolumeUp5TapEnabled,
-+  blocking_overlays_enabled: StorageService.saveBlockingOverlaysEnabled,
-+  webview_back_button_enabled: StorageService.saveWebViewBackButtonEnabled,
-+  auto_brightness_enabled: StorageService.saveAutoBrightnessEnabled,
-+  brightness_management_enabled: StorageService.saveBrightnessManagementEnabled,
-+  screen_scheduler_enabled: StorageService.saveScreenSchedulerEnabled,
-+  screen_scheduler_wake_on_touch: StorageService.saveScreenSchedulerWakeOnTouch,
-+  keep_screen_on: StorageService.saveKeepScreenOn,
-+  auto_wake_on_screen_off: StorageService.saveAutoWakeOnScreenOff,
-+  inactivity_return_enabled: StorageService.saveInactivityReturnEnabled,
-+  inactivity_return_reset_on_nav: StorageService.saveInactivityReturnResetOnNav,
-+  inactivity_return_clear_cache: StorageService.saveInactivityReturnClearCache,
-+  inactivity_return_scroll_top: StorageService.saveInactivityReturnScrollTop,
-+  url_filter_enabled: StorageService.saveUrlFilterEnabled,
-+  url_filter_show_feedback: StorageService.saveUrlFilterShowFeedback,
-+  pdf_viewer_enabled: StorageService.savePdfViewerEnabled,
-+  print_enabled: StorageService.savePrintEnabled,
-+  disable_user_zoom: StorageService.saveDisableUserZoom,
-+  mqtt_enabled: StorageService.saveMqttEnabled,
-+  mqtt_allow_control: StorageService.saveMqttAllowControl,
-+  mqtt_motion_always_on: StorageService.saveMqttMotionAlwaysOn,
-+  beta_updates_enabled: StorageService.saveBetaUpdatesEnabled,
-+  dashboard_mode_enabled: StorageService.saveDashboardModeEnabled,
-+  media_player_autoplay: StorageService.saveMediaPlayerAutoPlay,
-+  media_player_loop: StorageService.saveMediaPlayerLoop,
-+  media_player_shuffle: StorageService.saveMediaPlayerShuffle,
-+  media_player_show_controls: StorageService.saveMediaPlayerShowControls,
-+  media_player_transition: StorageService.saveMediaPlayerTransition,
-+  media_player_mute: StorageService.saveMediaPlayerMute,
++interface FieldSpec<T> {
++  get: () => Promise<T>;
++  set: (value: T) => Promise<void>;
++}
++
++type FieldTable<T> = Record<string, FieldSpec<T>>;
++
++const BOOL_FIELDS: FieldTable<boolean> = {
++  auto_reload: { get: StorageService.getAutoReload, set: StorageService.saveAutoReload },
++  kiosk_enabled: { get: StorageService.getKioskEnabled, set: StorageService.saveKioskEnabled },
++  auto_launch: { get: StorageService.getAutoLaunch, set: StorageService.saveAutoLaunch },
++  screensaver_enabled: { get: StorageService.getScreensaverEnabled, set: StorageService.saveScreensaverEnabled },
++  screensaver_video_loop: { get: StorageService.getScreensaverVideoLoop, set: StorageService.saveScreensaverVideoLoop },
++  screensaver_motion_enabled: { get: StorageService.getScreensaverMotionEnabled, set: StorageService.saveScreensaverMotionEnabled },
++  auto_relaunch_app: { get: StorageService.getAutoRelaunchApp, set: StorageService.saveAutoRelaunchApp },
++  overlay_button_visible: { get: StorageService.getOverlayButtonVisible, set: StorageService.saveOverlayButtonVisible },
++  status_bar_enabled: { get: StorageService.getStatusBarEnabled, set: StorageService.saveStatusBarEnabled },
++  status_bar_on_overlay: { get: StorageService.getStatusBarOnOverlay, set: StorageService.saveStatusBarOnOverlay },
++  status_bar_on_return: { get: StorageService.getStatusBarOnReturn, set: StorageService.saveStatusBarOnReturn },
++  status_bar_show_battery: { get: StorageService.getStatusBarShowBattery, set: StorageService.saveStatusBarShowBattery },
++  status_bar_show_wifi: { get: StorageService.getStatusBarShowWifi, set: StorageService.saveStatusBarShowWifi },
++  status_bar_show_bluetooth: { get: StorageService.getStatusBarShowBluetooth, set: StorageService.saveStatusBarShowBluetooth },
++  status_bar_show_volume: { get: StorageService.getStatusBarShowVolume, set: StorageService.saveStatusBarShowVolume },
++  status_bar_show_time: { get: StorageService.getStatusBarShowTime, set: StorageService.saveStatusBarShowTime },
++  battery_lock_enabled: { get: StorageService.getBatteryLockEnabled, set: StorageService.saveBatteryLockEnabled },
++  url_rotation_enabled: { get: StorageService.getUrlRotationEnabled, set: StorageService.saveUrlRotationEnabled },
++  url_planner_enabled: { get: StorageService.getUrlPlannerEnabled, set: StorageService.saveUrlPlannerEnabled },
++  rest_api_enabled: { get: StorageService.getRestApiEnabled, set: StorageService.saveRestApiEnabled },
++  rest_api_allow_control: { get: StorageService.getRestApiAllowControl, set: StorageService.saveRestApiAllowControl },
++  allow_power_button: { get: StorageService.getAllowPowerButton, set: StorageService.saveAllowPowerButton },
++  allow_notifications: { get: StorageService.getAllowNotifications, set: StorageService.saveAllowNotifications },
++  allow_system_info: { get: StorageService.getAllowSystemInfo, set: StorageService.saveAllowSystemInfo },
++  volume_up_5tap_enabled: { get: StorageService.getVolumeUp5TapEnabled, set: StorageService.saveVolumeUp5TapEnabled },
++  blocking_overlays_enabled: { get: StorageService.getBlockingOverlaysEnabled, set: StorageService.saveBlockingOverlaysEnabled },
++  webview_back_button_enabled: { get: StorageService.getWebViewBackButtonEnabled, set: StorageService.saveWebViewBackButtonEnabled },
++  auto_brightness_enabled: { get: StorageService.getAutoBrightnessEnabled, set: StorageService.saveAutoBrightnessEnabled },
++  brightness_management_enabled: { get: StorageService.getBrightnessManagementEnabled, set: StorageService.saveBrightnessManagementEnabled },
++  screen_scheduler_enabled: { get: StorageService.getScreenSchedulerEnabled, set: StorageService.saveScreenSchedulerEnabled },
++  screen_scheduler_wake_on_touch: { get: StorageService.getScreenSchedulerWakeOnTouch, set: StorageService.saveScreenSchedulerWakeOnTouch },
++  keep_screen_on: { get: StorageService.getKeepScreenOn, set: StorageService.saveKeepScreenOn },
++  auto_wake_on_screen_off: { get: StorageService.getAutoWakeOnScreenOff, set: StorageService.saveAutoWakeOnScreenOff },
++  inactivity_return_enabled: { get: StorageService.getInactivityReturnEnabled, set: StorageService.saveInactivityReturnEnabled },
++  inactivity_return_reset_on_nav: { get: StorageService.getInactivityReturnResetOnNav, set: StorageService.saveInactivityReturnResetOnNav },
++  inactivity_return_clear_cache: { get: StorageService.getInactivityReturnClearCache, set: StorageService.saveInactivityReturnClearCache },
++  inactivity_return_scroll_top: { get: StorageService.getInactivityReturnScrollTop, set: StorageService.saveInactivityReturnScrollTop },
++  url_filter_enabled: { get: StorageService.getUrlFilterEnabled, set: StorageService.saveUrlFilterEnabled },
++  url_filter_show_feedback: { get: StorageService.getUrlFilterShowFeedback, set: StorageService.saveUrlFilterShowFeedback },
++  pdf_viewer_enabled: { get: StorageService.getPdfViewerEnabled, set: StorageService.savePdfViewerEnabled },
++  print_enabled: { get: StorageService.getPrintEnabled, set: StorageService.savePrintEnabled },
++  disable_user_zoom: { get: StorageService.getDisableUserZoom, set: StorageService.saveDisableUserZoom },
++  mqtt_enabled: { get: StorageService.getMqttEnabled, set: StorageService.saveMqttEnabled },
++  mqtt_allow_control: { get: StorageService.getMqttAllowControl, set: StorageService.saveMqttAllowControl },
++  mqtt_motion_always_on: { get: StorageService.getMqttMotionAlwaysOn, set: StorageService.saveMqttMotionAlwaysOn },
++  beta_updates_enabled: { get: StorageService.getBetaUpdatesEnabled, set: StorageService.saveBetaUpdatesEnabled },
++  dashboard_mode_enabled: { get: StorageService.getDashboardModeEnabled, set: StorageService.saveDashboardModeEnabled },
++  media_player_autoplay: { get: StorageService.getMediaPlayerAutoPlay, set: StorageService.saveMediaPlayerAutoPlay },
++  media_player_loop: { get: StorageService.getMediaPlayerLoop, set: StorageService.saveMediaPlayerLoop },
++  media_player_shuffle: { get: StorageService.getMediaPlayerShuffle, set: StorageService.saveMediaPlayerShuffle },
++  media_player_show_controls: { get: StorageService.getMediaPlayerShowControls, set: StorageService.saveMediaPlayerShowControls },
++  media_player_transition: { get: StorageService.getMediaPlayerTransition, set: StorageService.saveMediaPlayerTransition },
++  media_player_mute: { get: StorageService.getMediaPlayerMute, set: StorageService.saveMediaPlayerMute },
 +};
 +
-+// String + enum fields. Enum setters are typed narrower than string; the cast
-+// is safe because the setter validates and this is an external-config boundary.
-+const STRING_FIELDS: Record<string, Setter<string>> = {
-+  url: StorageService.saveUrl,
-+  display_mode: StorageService.saveDisplayMode as Setter<string>,
-+  external_app_package: StorageService.saveExternalAppPackage,
-+  external_app_mode: StorageService.saveExternalAppMode as Setter<string>,
-+  pin_mode: StorageService.savePinMode as Setter<string>,
-+  keyboard_mode: StorageService.saveKeyboardMode,
-+  back_button_mode: StorageService.saveBackButtonMode,
-+  return_mode: StorageService.saveReturnMode,
-+  return_button_position: StorageService.saveReturnButtonPosition,
-+  status_bar_theme: StorageService.saveStatusBarTheme as Setter<string>,
-+  screensaver_type: StorageService.saveScreensaverType as Setter<string>,
-+  screensaver_url: StorageService.saveScreensaverUrl,
-+  motion_camera_position: StorageService.saveMotionCameraPosition as Setter<string>,
-+  screensaver_motion_sensitivity: StorageService.saveScreensaverMotionSensitivity,
-+  url_filter_mode: StorageService.saveUrlFilterMode,
-+  print_paper_size: StorageService.savePrintPaperSize,
-+  custom_user_agent: StorageService.saveCustomUserAgent,
-+  battery_lock_message: StorageService.saveBatteryLockMessage,
-+  mqtt_broker_url: StorageService.saveMqttBrokerUrl,
-+  mqtt_username: StorageService.saveMqttUsername,
-+  mqtt_client_id: StorageService.saveMqttClientId,
-+  mqtt_base_topic: StorageService.saveMqttBaseTopic,
-+  mqtt_discovery_prefix: StorageService.saveMqttDiscoveryPrefix,
-+  mqtt_device_name: StorageService.saveMqttDeviceName,
-+  media_player_fit_mode: StorageService.saveMediaPlayerFitMode as Setter<string>,
-+  media_player_bg_color: StorageService.saveMediaPlayerBgColor,
-+  http_basic_auth_username: StorageService.saveHttpBasicAuthUsername,
++// String + enum fields. Enum getters/setters are typed narrower than string;
++// the cast is safe because the setter validates and this is an external
++// config boundary.
++const STRING_FIELDS: FieldTable<string> = {
++  url: { get: StorageService.getUrl as () => Promise<string>, set: StorageService.saveUrl },
++  display_mode: { get: StorageService.getDisplayMode as () => Promise<string>, set: StorageService.saveDisplayMode as (v: string) => Promise<void> },
++  external_app_package: { get: StorageService.getExternalAppPackage as () => Promise<string>, set: StorageService.saveExternalAppPackage },
++  external_app_mode: { get: StorageService.getExternalAppMode as () => Promise<string>, set: StorageService.saveExternalAppMode as (v: string) => Promise<void> },
++  pin_mode: { get: StorageService.getPinMode as () => Promise<string>, set: StorageService.savePinMode as (v: string) => Promise<void> },
++  keyboard_mode: { get: StorageService.getKeyboardMode as () => Promise<string>, set: StorageService.saveKeyboardMode },
++  back_button_mode: { get: StorageService.getBackButtonMode as () => Promise<string>, set: StorageService.saveBackButtonMode },
++  return_mode: { get: StorageService.getReturnMode as () => Promise<string>, set: StorageService.saveReturnMode },
++  return_button_position: { get: StorageService.getReturnButtonPosition as () => Promise<string>, set: StorageService.saveReturnButtonPosition },
++  status_bar_theme: { get: StorageService.getStatusBarTheme as () => Promise<string>, set: StorageService.saveStatusBarTheme as (v: string) => Promise<void> },
++  screensaver_type: { get: StorageService.getScreensaverType as () => Promise<string>, set: StorageService.saveScreensaverType as (v: string) => Promise<void> },
++  screensaver_url: { get: StorageService.getScreensaverUrl as () => Promise<string>, set: StorageService.saveScreensaverUrl },
++  motion_camera_position: { get: StorageService.getMotionCameraPosition as () => Promise<string>, set: StorageService.saveMotionCameraPosition as (v: string) => Promise<void> },
++  screensaver_motion_sensitivity: { get: StorageService.getScreensaverMotionSensitivity as () => Promise<string>, set: StorageService.saveScreensaverMotionSensitivity },
++  url_filter_mode: { get: StorageService.getUrlFilterMode as () => Promise<string>, set: StorageService.saveUrlFilterMode },
++  print_paper_size: { get: StorageService.getPrintPaperSize as () => Promise<string>, set: StorageService.savePrintPaperSize },
++  custom_user_agent: { get: StorageService.getCustomUserAgent as () => Promise<string>, set: StorageService.saveCustomUserAgent },
++  battery_lock_message: { get: StorageService.getBatteryLockMessage as () => Promise<string>, set: StorageService.saveBatteryLockMessage },
++  mqtt_broker_url: { get: StorageService.getMqttBrokerUrl as () => Promise<string>, set: StorageService.saveMqttBrokerUrl },
++  mqtt_username: { get: StorageService.getMqttUsername as () => Promise<string>, set: StorageService.saveMqttUsername },
++  mqtt_client_id: { get: StorageService.getMqttClientId as () => Promise<string>, set: StorageService.saveMqttClientId },
++  mqtt_base_topic: { get: StorageService.getMqttBaseTopic as () => Promise<string>, set: StorageService.saveMqttBaseTopic },
++  mqtt_discovery_prefix: { get: StorageService.getMqttDiscoveryPrefix as () => Promise<string>, set: StorageService.saveMqttDiscoveryPrefix },
++  mqtt_device_name: { get: StorageService.getMqttDeviceName as () => Promise<string>, set: StorageService.saveMqttDeviceName },
++  media_player_fit_mode: { get: StorageService.getMediaPlayerFitMode as () => Promise<string>, set: StorageService.saveMediaPlayerFitMode as (v: string) => Promise<void> },
++  media_player_bg_color: { get: StorageService.getMediaPlayerBgColor as () => Promise<string>, set: StorageService.saveMediaPlayerBgColor },
++  http_basic_auth_username: { get: StorageService.getHttpBasicAuthUsername as () => Promise<string>, set: StorageService.saveHttpBasicAuthUsername },
 +};
 +
-+const NUMBER_FIELDS: Record<string, Setter<number>> = {
-+  pin_max_attempts: StorageService.savePinMaxAttempts,
-+  back_button_timer_delay: StorageService.saveBackButtonTimerDelay,
-+  url_rotation_interval: StorageService.saveUrlRotationInterval,
-+  rest_api_port: StorageService.saveRestApiPort,
-+  return_tap_count: StorageService.saveReturnTapCount,
-+  return_tap_timeout: StorageService.saveReturnTapTimeout,
-+  screensaver_brightness: StorageService.saveScreensaverBrightness,
-+  screensaver_inactivity_delay: StorageService.saveScreensaverInactivityDelay,
-+  default_brightness: StorageService.saveDefaultBrightness,
-+  battery_lock_threshold: StorageService.saveBatteryLockThreshold,
-+  battery_warn_threshold: StorageService.saveBatteryWarnThreshold,
-+  battery_release_threshold: StorageService.saveBatteryReleaseThreshold,
-+  battery_warn_step: StorageService.saveBatteryWarnStep,
-+  webview_back_button_x_percent: StorageService.saveWebViewBackButtonXPercent,
-+  webview_back_button_y_percent: StorageService.saveWebViewBackButtonYPercent,
-+  auto_brightness_min: StorageService.saveAutoBrightnessMin,
-+  auto_brightness_max: StorageService.saveAutoBrightnessMax,
-+  auto_brightness_offset: StorageService.saveAutoBrightnessOffset,
-+  inactivity_return_delay: StorageService.saveInactivityReturnDelay,
-+  webview_zoom_level: StorageService.saveWebViewZoomLevel,
-+  mqtt_port: StorageService.saveMqttPort,
-+  mqtt_status_interval: StorageService.saveMqttStatusInterval,
-+  media_player_image_duration: StorageService.saveMediaPlayerImageDuration,
-+  media_player_transition_duration: StorageService.saveMediaPlayerTransitionDuration,
++const NUMBER_FIELDS: FieldTable<number> = {
++  pin_max_attempts: { get: StorageService.getPinMaxAttempts, set: StorageService.savePinMaxAttempts },
++  back_button_timer_delay: { get: StorageService.getBackButtonTimerDelay, set: StorageService.saveBackButtonTimerDelay },
++  url_rotation_interval: { get: StorageService.getUrlRotationInterval, set: StorageService.saveUrlRotationInterval },
++  rest_api_port: { get: StorageService.getRestApiPort, set: StorageService.saveRestApiPort },
++  return_tap_count: { get: StorageService.getReturnTapCount, set: StorageService.saveReturnTapCount },
++  return_tap_timeout: { get: StorageService.getReturnTapTimeout, set: StorageService.saveReturnTapTimeout },
++  screensaver_brightness: { get: StorageService.getScreensaverBrightness, set: StorageService.saveScreensaverBrightness },
++  screensaver_inactivity_delay: { get: StorageService.getScreensaverInactivityDelay, set: StorageService.saveScreensaverInactivityDelay },
++  default_brightness: { get: StorageService.getDefaultBrightness, set: StorageService.saveDefaultBrightness },
++  battery_lock_threshold: { get: StorageService.getBatteryLockThreshold, set: StorageService.saveBatteryLockThreshold },
++  battery_warn_threshold: { get: StorageService.getBatteryWarnThreshold, set: StorageService.saveBatteryWarnThreshold },
++  battery_release_threshold: { get: StorageService.getBatteryReleaseThreshold, set: StorageService.saveBatteryReleaseThreshold },
++  battery_warn_step: { get: StorageService.getBatteryWarnStep, set: StorageService.saveBatteryWarnStep },
++  webview_back_button_x_percent: { get: StorageService.getWebViewBackButtonXPercent, set: StorageService.saveWebViewBackButtonXPercent },
++  webview_back_button_y_percent: { get: StorageService.getWebViewBackButtonYPercent, set: StorageService.saveWebViewBackButtonYPercent },
++  auto_brightness_min: { get: StorageService.getAutoBrightnessMin, set: StorageService.saveAutoBrightnessMin },
++  auto_brightness_max: { get: StorageService.getAutoBrightnessMax, set: StorageService.saveAutoBrightnessMax },
++  auto_brightness_offset: { get: StorageService.getAutoBrightnessOffset, set: StorageService.saveAutoBrightnessOffset },
++  inactivity_return_delay: { get: StorageService.getInactivityReturnDelay, set: StorageService.saveInactivityReturnDelay },
++  webview_zoom_level: { get: StorageService.getWebViewZoomLevel, set: StorageService.saveWebViewZoomLevel },
++  mqtt_port: { get: StorageService.getMqttPort, set: StorageService.saveMqttPort },
++  mqtt_status_interval: { get: StorageService.getMqttStatusInterval, set: StorageService.saveMqttStatusInterval },
++  media_player_image_duration: { get: StorageService.getMediaPlayerImageDuration, set: StorageService.saveMediaPlayerImageDuration },
++  media_player_transition_duration: { get: StorageService.getMediaPlayerTransitionDuration, set: StorageService.saveMediaPlayerTransitionDuration },
 +};
 +
-+// Array / object-array fields (convention 2 + 4). Typed loosely as unknown[]
-+// since the setters each expect their own element shape; the console-authored
-+// JSON is responsible for matching those shapes.
-+const ARRAY_FIELDS: Record<string, Setter<any[]>> = {
-+  url_rotation_list: StorageService.saveUrlRotationList,
-+  url_planner_events: StorageService.saveUrlPlannerEvents,
-+  blocking_overlays_regions: StorageService.saveBlockingOverlaysRegions,
-+  screen_scheduler_rules: StorageService.saveScreenSchedulerRules,
-+  url_filter_list: StorageService.saveUrlFilterList,
-+  managed_apps: StorageService.saveManagedApps,
-+  screensaver_video_items: StorageService.saveScreensaverVideoItems,
-+  media_player_items: StorageService.saveMediaPlayerItems,
-+  dashboard_tiles: StorageService.saveDashboardTiles,
++// Array / object-array fields (convention 2 + 4). Typed loosely as any[]
++// since each setter/getter expects its own element shape; the console-authored
++// JSON is responsible for matching those shapes. Equality is JSON.stringify-
++// based (order-sensitive) — see applyFieldGroup's arrayEquals.
++const ARRAY_FIELDS: FieldTable<any[]> = {
++  url_rotation_list: { get: StorageService.getUrlRotationList, set: StorageService.saveUrlRotationList },
++  url_planner_events: { get: StorageService.getUrlPlannerEvents, set: StorageService.saveUrlPlannerEvents },
++  blocking_overlays_regions: { get: StorageService.getBlockingOverlaysRegions, set: StorageService.saveBlockingOverlaysRegions },
++  screen_scheduler_rules: { get: StorageService.getScreenSchedulerRules, set: StorageService.saveScreenSchedulerRules },
++  url_filter_list: { get: StorageService.getUrlFilterList, set: StorageService.saveUrlFilterList },
++  managed_apps: { get: StorageService.getManagedApps, set: StorageService.saveManagedApps },
++  screensaver_video_items: { get: StorageService.getScreensaverVideoItems, set: StorageService.saveScreensaverVideoItems },
++  media_player_items: { get: StorageService.getMediaPlayerItems, set: StorageService.saveMediaPlayerItems },
++  dashboard_tiles: { get: StorageService.getDashboardTiles, set: StorageService.saveDashboardTiles },
 +};
 +
 +// ---- PIN (convention 3) ----------------------------------------------------
@@ -1806,57 +1827,103 @@ index 0000000..bb4fac4
 +  );
 +}
 +
-+// ---- bulk apply (version-gated) --------------------------------------------
++// ---- bulk apply (version-gated, per-field diffed) --------------------------
++
++type FieldOutcome =
++  | { key: string; outcome: 'applied' }
++  | { key: string; outcome: 'skipped' }
++  | { key: string; outcome: 'error'; reason: string };
++
++export interface BulkApplyResult {
++  applied: string[];
++  skipped: string[];
++  errors: { key: string; reason: string }[];
++}
 +
 +/**
-+ * Apply the managedConfig blob's fields. Assumes the caller has already decided
-+ * config_version changed. Returns true if at least one field was written.
++ * Apply one field group: for every key present in `payload` that this table
++ * knows about, coerce the incoming value, compare it against what's
++ * currently stored, and only write on a genuine difference. A coercion
++ * failure or a thrown write is recorded as an error for THAT KEY ONLY — it
++ * never aborts the rest of the group or the other groups (convention 6: one
++ * bad or unchanged field never discards the whole push).
 + */
-+async function applyBulk(managedConfig: Record<string, unknown>): Promise<boolean> {
-+  let changed = false;
++async function applyFieldGroup<T>(
++  payload: Record<string, unknown>,
++  table: FieldTable<T>,
++  coerce: (raw: unknown) => { value: T } | { error: string },
++  equals: (a: T, b: T) => boolean,
++  results: FieldOutcome[],
++): Promise<void> {
++  for (const [key, spec] of Object.entries(table)) {
++    if (!(key in payload)) continue;
 +
-+  for (const [key, setter] of Object.entries(BOOL_FIELDS)) {
-+    if (key in managedConfig) {
-+      await setter(toBool(managedConfig[key]));
-+      changed = true;
++    const coerced = coerce(payload[key]);
++    if ('error' in coerced) {
++      results.push({ key, outcome: 'error', reason: coerced.error });
++      continue;
 +    }
-+  }
-+  for (const [key, setter] of Object.entries(STRING_FIELDS)) {
-+    if (key in managedConfig) {
-+      await setter(toStr(managedConfig[key]));
-+      changed = true;
-+    }
-+  }
-+  for (const [key, setter] of Object.entries(NUMBER_FIELDS)) {
-+    if (key in managedConfig) {
-+      const n = toNum(managedConfig[key]);
-+      if (n !== undefined) {
-+        await setter(n);
-+        changed = true;
-+      } else {
-+        console.warn(`[ManagedConfig] ${key}: not a finite number, skipped`, managedConfig[key]);
-+      }
-+    }
-+  }
-+  for (const [key, setter] of Object.entries(ARRAY_FIELDS)) {
-+    if (key in managedConfig) {
-+      const list = resolveList(managedConfig[key]);
-+      if (list !== undefined) {
-+        await setter(list);
-+        changed = true;
-+      } else {
-+        console.warn(`[ManagedConfig] ${key}: not an array, skipped`, managedConfig[key]);
-+      }
-+    }
-+  }
 +
-+  return changed;
++    try {
++      const current = await spec.get();
++      if (equals(current, coerced.value)) {
++        results.push({ key, outcome: 'skipped' });
++        continue;
++      }
++      await spec.set(coerced.value);
++      results.push({ key, outcome: 'applied' });
++    } catch (e) {
++      results.push({ key, outcome: 'error', reason: e instanceof Error ? e.message : String(e) });
++    }
++  }
++}
++
++const scalarEquals = <T,>(a: T, b: T) => a === b;
++const arrayEquals = (a: any[], b: any[]) => JSON.stringify(a) === JSON.stringify(b);
++
++/**
++ * Apply the flattened restrictions bundle's fields. Assumes the caller has
++ * already decided config_version changed.
++ */
++async function applyBulk(payload: Record<string, unknown>): Promise<BulkApplyResult> {
++  const results: FieldOutcome[] = [];
++
++  await applyFieldGroup<boolean>(payload, BOOL_FIELDS, (v) => ({ value: toBool(v) }), scalarEquals, results);
++  await applyFieldGroup<string>(payload, STRING_FIELDS, (v) => ({ value: toStr(v) }), scalarEquals, results);
++  await applyFieldGroup<number>(
++    payload,
++    NUMBER_FIELDS,
++    (v) => {
++      const n = toNum(v);
++      return n !== undefined ? { value: n } : { error: `"${String(v)}" is not a finite number` };
++    },
++    scalarEquals,
++    results,
++  );
++  await applyFieldGroup<any[]>(
++    payload,
++    ARRAY_FIELDS,
++    (v) => {
++      const list = resolveList(v);
++      return list !== undefined ? { value: list } : { error: 'value is not an array (and not the ["__CLEAR__"] sentinel)' };
++    },
++    arrayEquals,
++    results,
++  );
++
++  return {
++    applied: results.filter((r): r is { key: string; outcome: 'applied' } => r.outcome === 'applied').map((r) => r.key),
++    skipped: results.filter((r): r is { key: string; outcome: 'skipped' } => r.outcome === 'skipped').map((r) => r.key),
++    errors: results
++      .filter((r): r is { key: string; outcome: 'error'; reason: string } => r.outcome === 'error')
++      .map((r) => ({ key: r.key, reason: r.reason })),
++  };
 +}
 +
 +export interface ApplyResult {
 +  /** PIN was changed (never triggers a reload). */
 +  pinChanged: boolean;
-+  /** Bulk config_version changed and fields were applied (may trigger reload). */
++  /** At least one bulk field was actually written (triggers a live reload). */
 +  bulkApplied: boolean;
 +}
 +
@@ -1864,10 +1931,9 @@ index 0000000..bb4fac4
 + * Top-level entry: apply an incoming restrictions bundle.
 + *
 + * `restrictions` is the whole App Restrictions object as read by the native
-+ * module. IMPORTANT: the Headwind launcher FLATTENS the `managedConfig`
-+ * attribute's JSON keys directly into the top level of this bundle (see
-+ * AppRestrictionUpdater.parseManagedConfig on the launcher side) — there is no
-+ * nested `managedConfig` object on the device. So `config_version`, every
++ * module. Per convention 5, the launcher flattens the managedConfig
++ * attribute's JSON keys directly into the top level of this bundle — there is
++ * no nested `managedConfig` object on the device. So `config_version`, every
 + * setting key, and the PIN siblings (`kiosk_pin`, `kiosk_pin_label`) all live
 + * directly on `restrictions`.
 + */
@@ -1908,17 +1974,40 @@ index 0000000..bb4fac4
 +    return result;
 +  }
 +
-+  const changed = await applyBulk(restrictions);
++  const bulkResult = await applyBulk(restrictions);
 +  await StorageService.saveManagedConfigVersion(incomingVersion);
-+  result.bulkApplied = changed;
-+  console.log(`[ManagedConfig] bulk apply done, changed=${changed}`);
++  result.bulkApplied = bulkResult.applied.length > 0;
 +
-+  // Ack on every version advance (even changed===false), so the console's
-+  // custom1 column reliably reflects "device picked up version N".
++  const status: 'Success' | 'Error' = bulkResult.errors.length === 0 ? 'Success' : 'Error';
++
++  if (status === 'Success') {
++    console.log(
++      `[ManagedConfig] INFO: config #${incomingVersion} applied successfully. ` +
++        `Applied [${bulkResult.applied.join(', ') || 'none'}]. ` +
++        `Ignored, already matched device [${bulkResult.skipped.join(', ') || 'none'}].`,
++    );
++  } else {
++    console.error(
++      `[ManagedConfig] ERROR: config #${incomingVersion} had ${bulkResult.errors.length} field failure(s): ` +
++        bulkResult.errors.map((e) => `${e.key} (${e.reason})`).join('; '),
++    );
++    if (bulkResult.applied.length > 0 || bulkResult.skipped.length > 0) {
++      console.log(
++        `[ManagedConfig] INFO: remaining fields still processed — ` +
++          `applied [${bulkResult.applied.join(', ') || 'none'}], ` +
++          `ignored, already matched device [${bulkResult.skipped.join(', ') || 'none'}].`,
++      );
++    }
++  }
++
++  // Ack on every version advance (even a fully-skipped, no-op push), so the
++  // console's custom1 column reliably reflects "device saw version N" and
++  // whether it fully succeeded.
++  const ackValue = `Config #${incomingVersion} ${status}`;
 +  if (native) {
 +    try {
-+      await native.reportCustom(1, incomingVersion);
-+      console.log(`[ManagedConfig] reported config ack custom1=${incomingVersion}`);
++      await native.reportCustom(1, ackValue);
++      console.log(`[ManagedConfig] reported config ack custom1="${ackValue}"`);
 +    } catch (e) {
 +      console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
 +    }
@@ -1926,6 +2015,36 @@ index 0000000..bb4fac4
 +
 +  return result;
 +}
+diff --git a/src/utils/kioskScreenActions.ts b/src/utils/kioskScreenActions.ts
+new file mode 100644
+index 0000000..32a2cbb
+--- /dev/null
++++ b/src/utils/kioskScreenActions.ts
+@@ -0,0 +1,24 @@
++/**
++ * Live-reload registration for KioskScreen.
++ *
++ * Lets the managed-config applier refresh currently-loaded settings on the
++ * mounted Kiosk screen directly — no navigation, no remount, no reboot —
++ * exactly matching how PIN changes already take effect (read fresh at
++ * PIN-entry time, nothing to refresh). React Navigation's native-stack keeps
++ * KioskScreen mounted in the background when Settings/Pin are pushed on top
++ * (no `unmountOnBlur`), so calling reloadSettings() here is always safe: if
++ * Kiosk is the foreground screen the update is visible instantly; if not, the
++ * background screen is quietly refreshed and shows the new state the moment
++ * the user navigates back — either way nothing is ever interrupted mid-edit.
++ *
++ * KioskScreen registers itself on mount / clears on unmount; a plain module
++ * ref (not a React ref) is used because the applier lives outside the
++ * component tree (called from a native-event listener at the app root).
++ */
++export interface KioskScreenActions {
++  reloadSettings: () => void;
++}
++
++export const kioskScreenActionsRef: { current: KioskScreenActions | null } = {
++  current: null,
++};
 diff --git a/src/utils/secureStorage.ts b/src/utils/secureStorage.ts
 index 4dbb58e..827f521 100644
 --- a/src/utils/secureStorage.ts
