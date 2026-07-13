@@ -1577,10 +1577,10 @@ index d00f06d..d8c4da5 100644
      // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..ddbc232
+index 0000000..270314c
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,636 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1592,11 +1592,13 @@ index 0000000..ddbc232
 + * ManagedConfigModule reads the whole restrictions bundle and hands it here.
 + *
 + * Conventions this file depends on (see the managed-config plan):
-+ *   1. Any number that can exceed 32-bit int range is sent as a JSON *string*
-+ *      (the launcher's parseManagedConfig has a Long→int cast bug that would
-+ *      otherwise silently drop the entire blob). Number fields here coerce with
-+ *      Number(), which accepts both real numbers and numeric strings, so this is
-+ *      handled uniformly.
++ *   1. Any number that can exceed 32-bit int range — AND ANY DECIMAL — must be
++ *      sent as a JSON *string*. The launcher's parseManagedConfig has TWO cast
++ *      bugs: Long→(int) and Double→(float), both throwing ClassCastException
++ *      mid-parse; every key AFTER the offending one is silently dropped
++ *      (earlier keys survive, which is why config_version — always first —
++ *      keeps arriving while later fields vanish). Number fields here coerce
++ *      with Number(), which accepts numeric strings, so quoting is lossless.
 + *   2. A list cannot be emptied with a bare [] (the launcher skips zero-length
 + *      arrays). The sentinel ["__CLEAR__"] means "set this list to empty".
 + *   3. kiosk_pin is a top-level, ungated, normalized, separately-acked entry —
@@ -1616,6 +1618,16 @@ index 0000000..ddbc232
 + *      push is a list of desired values, not a list of commands, so one
 + *      field matching what's already there never blocks any other field in
 + *      the same push. See applyBulk()/applyFieldGroup().
++ *   7. Version gating with content fingerprint: same version + same payload =
++ *      routine re-delivery (silent skip; the launcher re-sends on every sync
++ *      and app restart). Same version + CHANGED payload = operator forgot to
++ *      bump config_version → ERROR, nothing applied. Numerically LOWER
++ *      version than last applied = regression → ERROR, nothing applied.
++ *   8. Push-shape validation: unknown keys (typos/case mistakes) are reported
++ *      as errors; the optional `config_fields` key (comma-separated string of
++ *      expected field names) lets the device detect fields that were dropped
++ *      upstream by the launcher parser bugs and report them as errors too.
++ *      Both are non-blocking — valid fields in the same push still apply.
 + */
 +
 +import { StorageService } from './storage';
@@ -1863,6 +1875,60 @@ index 0000000..ddbc232
 +  dashboard_tiles: { get: StorageService.getDashboardTiles, set: StorageService.saveDashboardTiles },
 +};
 +
++// ---- push-shape helpers (conventions 7-8) -----------------------------------
++
++// Keys that are legitimate at the top level of the restrictions bundle but are
++// not settings fields themselves.
++const RESERVED_KEYS = new Set(['config_version', 'config_fields', 'kiosk_pin', 'kiosk_pin_label']);
++
++const KNOWN_FIELD_KEYS = new Set([
++  ...Object.keys(BOOL_FIELDS),
++  ...Object.keys(STRING_FIELDS),
++  ...Object.keys(NUMBER_FIELDS),
++  ...Object.keys(ARRAY_FIELDS),
++]);
++
++/**
++ * Stable fingerprint of the config payload (sorted keys, PIN siblings
++ * excluded — a per-device PIN rotation legitimately changes the bundle
++ * without a config_version bump and must not look like an unbumped edit).
++ */
++function computeFingerprint(restrictions: Record<string, unknown>): string {
++  const keys = Object.keys(restrictions)
++    .filter((k) => k !== 'kiosk_pin' && k !== 'kiosk_pin_label')
++    .sort();
++  const obj: Record<string, unknown> = {};
++  for (const k of keys) obj[k] = restrictions[k];
++  try {
++    return JSON.stringify(obj);
++  } catch {
++    return keys.join(',');
++  }
++}
++
++/** Parse the optional config_fields manifest: comma-separated string or string array. */
++function parseConfigFields(v: unknown): string[] | undefined {
++  if (typeof v === 'string') return v.split(',').map((s) => s.trim()).filter(Boolean);
++  if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
++  return undefined;
++}
++
++/** Report the per-push status to the console's custom1 column. */
++async function reportConfigAck(
++  native: ManagedConfigNative | undefined,
++  version: string,
++  status: 'Success' | 'Error',
++): Promise<void> {
++  if (!native) return;
++  const ackValue = `Config #${version} ${status}`;
++  try {
++    await native.reportCustom(1, ackValue);
++    console.log(`[ManagedConfig] reported config ack custom1="${ackValue}"`);
++  } catch (e) {
++    console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
++  }
++}
++
 +// ---- PIN (convention 3) ----------------------------------------------------
 +
 +/**
@@ -2058,16 +2124,71 @@ index 0000000..ddbc232
 +
 +  const lastVersion = await StorageService.getManagedConfigVersion();
 +  console.log(`[ManagedConfig] config_version incoming=${incomingVersion} last=${lastVersion ?? '(none)'}`);
++
++  const fingerprint = computeFingerprint(restrictions);
++
++  // Convention 7a: same version — routine re-delivery vs unbumped edit.
 +  if (incomingVersion === lastVersion) {
-+    console.log('[ManagedConfig] config_version unchanged; skipping bulk apply');
++    const lastFingerprint = await StorageService.getManagedConfigFingerprint();
++    if (lastFingerprint !== null && lastFingerprint !== fingerprint) {
++      logError(
++        native,
++        `config #${incomingVersion} rejected — payload content changed but config_version was not bumped (still ${incomingVersion}). Increment config_version for these changes to apply.`,
++      );
++      await reportConfigAck(native, incomingVersion, 'Error');
++    } else {
++      console.log('[ManagedConfig] config_version unchanged; skipping bulk apply (routine re-delivery)');
++    }
 +    return result;
++  }
++
++  // Convention 7b: numeric version regression.
++  const incomingNum = Number(incomingVersion);
++  const lastNum = lastVersion !== null ? Number(lastVersion) : NaN;
++  if (Number.isFinite(incomingNum) && Number.isFinite(lastNum) && incomingNum < lastNum) {
++    logError(
++      native,
++      `config #${incomingVersion} rejected — version regression (incoming ${incomingVersion} is lower than last applied ${lastVersion}). Use a config_version higher than ${lastVersion}.`,
++    );
++    await reportConfigAck(native, incomingVersion, 'Error');
++    return result;
++  }
++
++  // Convention 8: push-shape validation — unknown keys and the optional
++  // config_fields manifest. Non-blocking: valid fields still apply below.
++  const shapeErrors: string[] = [];
++  const unknownKeys = Object.keys(restrictions).filter(
++    (k) => !KNOWN_FIELD_KEYS.has(k) && !RESERVED_KEYS.has(k),
++  );
++  if (unknownKeys.length > 0) {
++    shapeErrors.push(
++      `unrecognized field(s) [${unknownKeys.join(', ')}] — check spelling and case (keys are case-sensitive)`,
++    );
++  }
++  const announced = parseConfigFields(restrictions.config_fields);
++  if (announced) {
++    const announcedUnknown = announced.filter((k) => !KNOWN_FIELD_KEYS.has(k));
++    if (announcedUnknown.length > 0) {
++      shapeErrors.push(`config_fields announces unknown field name(s) [${announcedUnknown.join(', ')}]`);
++    }
++    const missingAnnounced = announced.filter((k) => KNOWN_FIELD_KEYS.has(k) && !(k in restrictions));
++    if (missingAnnounced.length > 0) {
++      shapeErrors.push(
++        `field(s) announced in config_fields but missing from the delivered payload [${missingAnnounced.join(', ')}] — likely dropped upstream by the launcher parser (unquoted decimal, or a number beyond 32-bit range?)`,
++      );
++    }
++  }
++  for (const msg of shapeErrors) {
++    logError(native, `config #${incomingVersion} — ${msg}`);
 +  }
 +
 +  const bulkResult = await applyBulk(restrictions);
 +  await StorageService.saveManagedConfigVersion(incomingVersion);
++  await StorageService.saveManagedConfigFingerprint(fingerprint);
 +  result.bulkApplied = bulkResult.applied.length > 0;
 +
-+  const status: 'Success' | 'Error' = bulkResult.errors.length === 0 ? 'Success' : 'Error';
++  const status: 'Success' | 'Error' =
++    bulkResult.errors.length === 0 && shapeErrors.length === 0 ? 'Success' : 'Error';
 +
 +  // Three independent business-outcome logs, each only emitted when there's
 +  // something to say, each carrying the actual field value (not just the key
@@ -2092,15 +2213,7 @@ index 0000000..ddbc232
 +  // Ack on every version advance (even a fully-skipped, no-op push), so the
 +  // console's custom1 column reliably reflects "device saw version N" and
 +  // whether it fully succeeded.
-+  const ackValue = `Config #${incomingVersion} ${status}`;
-+  if (native) {
-+    try {
-+      await native.reportCustom(1, ackValue);
-+      console.log(`[ManagedConfig] reported config ack custom1="${ackValue}"`);
-+    } catch (e) {
-+      console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
-+    }
-+  }
++  await reportConfigAck(native, incomingVersion, status);
 +
 +  return result;
 +}
@@ -2178,20 +2291,24 @@ index 4dbb58e..827f521 100644
   * Migrate old plaintext PIN to secure storage
   */
 diff --git a/src/utils/storage.ts b/src/utils/storage.ts
-index 98f5f8a..0fd745a 100644
+index 98f5f8a..b94abbf 100644
 --- a/src/utils/storage.ts
 +++ b/src/utils/storage.ts
-@@ -163,6 +163,9 @@ const KEYS = {
+@@ -163,6 +163,13 @@ const KEYS = {
    DASHBOARD_TILES: '@kiosk_dashboard_tiles',
    // HTTP Basic Auth
    HTTP_BASIC_AUTH_USERNAME: '@kiosk_http_basic_auth_username',
 +  // Managed config (Headwind MDM App Restrictions): last applied config_version,
 +  // used to gate the bulk apply so an unchanged re-delivery is a no-op.
 +  MANAGED_CONFIG_VERSION: '@kiosk_managed_config_version',
++  // Fingerprint (stable JSON) of the last applied config payload — used to
++  // distinguish a routine same-version re-delivery (silent skip) from an
++  // operator editing the payload without bumping config_version (an error).
++  MANAGED_CONFIG_FINGERPRINT: '@kiosk_managed_config_fingerprint',
  };
  
  export const StorageService = {
-@@ -2675,6 +2678,23 @@ export const StorageService = {
+@@ -2675,6 +2682,40 @@ export const StorageService = {
      }
    },
  
@@ -2208,6 +2325,23 @@ index 98f5f8a..0fd745a 100644
 +      return await AsyncStorage.getItem(KEYS.MANAGED_CONFIG_VERSION);
 +    } catch (error) {
 +      console.error('Error getting managed config version:', error);
++      return null;
++    }
++  },
++
++  saveManagedConfigFingerprint: async (value: string): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.MANAGED_CONFIG_FINGERPRINT, value);
++    } catch (error) {
++      console.error('Error saving managed config fingerprint:', error);
++    }
++  },
++
++  getManagedConfigFingerprint: async (): Promise<string | null> => {
++    try {
++      return await AsyncStorage.getItem(KEYS.MANAGED_CONFIG_FINGERPRINT);
++    } catch (error) {
++      console.error('Error getting managed config fingerprint:', error);
 +      return null;
 +    }
 +  },
