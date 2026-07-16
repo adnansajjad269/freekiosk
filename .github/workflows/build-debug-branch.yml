@@ -1,0 +1,77 @@
+name: Build Debug Branch APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+
+      - name: Verify branch
+        run: |
+          echo "Branch: ${{ github.ref_name }}"
+          git rev-parse --short HEAD
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.1.12297006" \
+            "cmake;3.22.1"
+
+      - name: Create Gradle config
+        run: cp android/gradle.properties.template android/gradle.properties
+
+      - name: Configure signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/fleet.keystore
+            {
+              echo "FREEKIOSK_UPLOAD_STORE_FILE=fleet.keystore"
+              echo "FREEKIOSK_UPLOAD_STORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "FREEKIOSK_UPLOAD_KEY_ALIAS=$KEY_ALIAS"
+              echo "FREEKIOSK_UPLOAD_KEY_PASSWORD=$KEY_PASSWORD"
+            } >> android/gradle.properties
+          fi
+
+      - name: Install JS dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build Release APK
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeKiosk-debug
+          path: android/app/build/outputs/apk/release/app-release.apk
+
