@@ -1,0 +1,27 @@
+diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+index f0863fd..b66afde 100644
+--- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+@@ -77,8 +77,20 @@ class MainActivity : ReactActivity() {
+   override fun onCreate(savedInstanceState: Bundle?) {
+     super.onCreate(null)
+ 
+-    // Keep screen always on
+-    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++    // Keep screen on. PATCH patch_keep_screen_on (default ON, ADB-toggleable):
++    // when the patch is ON, only add FLAG_KEEP_SCREEN_ON if the "Keep Screen On"
++    // setting is enabled — previously the flag was added unconditionally on every
++    // onCreate, re-pinning it on every activity recreation and racing
++    // loadSettings()'s attempt to clear it, so the screen stayed on even with the
++    // setting OFF. When the patch is OFF, restore upstream behavior (always add).
++    val fkSettings = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++    if (fkSettings.getBoolean("patch_keep_screen_on_enabled", true)) {
++        if (fkSettings.getBoolean("keep_screen_on", true)) {
++            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        }
++    } else {
++        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++    }
+ 
+     // Extend content into display cutout areas to prevent OEM chrome from appearing (#94)
+     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {

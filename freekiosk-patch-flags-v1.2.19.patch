@@ -1,0 +1,92 @@
+diff --git a/android/app/src/main/java/com/freekiosk/KioskModule.kt b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+index ccf512a..b165be2 100644
+--- a/android/app/src/main/java/com/freekiosk/KioskModule.kt
++++ b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+@@ -1138,4 +1138,31 @@ class KioskModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
+             promise.reject("ERROR", "bringToFront failed: ${e.message}")
+         }
+     }
++
++    /**
++     * Return the patch feature-flags. Each patch (keyboard-gap, force_text,
++     * gboard, boot-splash, keep-screen-on, wakelock) is gated by a boolean in
++     * FreeKioskSettings keyed `patch_<name>_enabled`, defaulting to true (patch
++     * active). Native patches read the pref directly; JS feature patches call
++     * this. If this method is absent (base patch not applied) callers should
++     * treat every patch as enabled, so each feature patch still works standalone.
++     * Set via ADB — see MainActivity.handleAdbConfig patch-flag ingestion.
++     */
++    @ReactMethod
++    fun getPatchFlags(promise: Promise) {
++        try {
++            val prefs = reactApplicationContext.getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++            val keys = arrayOf(
++                "patch_keyboard_gap", "patch_force_text", "patch_gboard",
++                "patch_boot_splash", "patch_keep_screen_on", "patch_wakelock"
++            )
++            val result = com.facebook.react.bridge.Arguments.createMap()
++            for (k in keys) {
++                result.putBoolean("${k}_enabled", prefs.getBoolean("${k}_enabled", true))
++            }
++            promise.resolve(result)
++        } catch (e: Exception) {
++            promise.reject("ERROR", "Failed to get patch flags: ${e.message}")
++        }
++    }
+ }
+diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+index d373884..f0863fd 100644
+--- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+@@ -984,6 +984,37 @@ class MainActivity : ReactActivity() {
+       }
+     }
+     
++    // ---- Patch feature-flags (ADB on/off control) --------------------------
++    // Written straight to FreeKioskSettings — the store native patches read at
++    // boot/onCreate — so a `patch_*` sent inside the `config` JSON takes effect
++    // on the next start. Each recognized key maps to a `<key>_enabled` boolean;
++    // an unset flag defaults to ON, so omitting a key leaves that patch active.
++    // (Added by freekiosk-patch-flags: the 6 feature patches read these but never
++    // touch this method, so they stay independent of one another.)
++    if (configJson != null) {
++      try {
++        val pcfg = org.json.JSONObject(configJson)
++        val patchKeys = arrayOf(
++          "patch_keyboard_gap", "patch_force_text", "patch_gboard",
++          "patch_boot_splash", "patch_keep_screen_on", "patch_wakelock"
++        )
++        val flagPrefs = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++        val flagEditor = flagPrefs.edit()
++        var wroteFlag = false
++        for (pk in patchKeys) {
++          if (pcfg.has(pk)) {
++            val on = pcfg.optString(pk, "true").let { it == "true" || it == "1" }
++            flagEditor.putBoolean("${pk}_enabled", on)
++            wroteFlag = true
++            android.util.Log.i("FreeKiosk-ADB", "Patch flag ${pk}_enabled = $on")
++          }
++        }
++        if (wroteFlag) flagEditor.commit()
++      } catch (e: Exception) {
++        android.util.Log.e("FreeKiosk-ADB", "Failed to parse patch flags: ${e.message}")
++      }
++    }
++
+     // PIN verified - Save configuration to SharedPreferences as "pending config"
+     // React Native (KioskScreen) will read this on startup and apply to AsyncStorage
+     // This avoids Room/AsyncStorage v2 database compatibility issues
+diff --git a/src/utils/KioskModule.ts b/src/utils/KioskModule.ts
+index ebdb027..eadc59f 100644
+--- a/src/utils/KioskModule.ts
++++ b/src/utils/KioskModule.ts
+@@ -37,6 +37,9 @@ interface KioskModuleInterface {
+   openAndroidSettings(settingsPage?: string | null): Promise<boolean>;
+   // Bring FreeKiosk's activity to foreground (used when screensaver activates in External App mode)
+   bringToFront(): Promise<boolean>;
++  // Patch feature-flags: { patch_<name>_enabled: boolean }, each defaulting to
++  // true. Gates the JS-side feature patches. Set via ADB (see MainActivity).
++  getPatchFlags(): Promise<Record<string, boolean>>;
+ }
+ 
+ const { KioskModule } = NativeModules;

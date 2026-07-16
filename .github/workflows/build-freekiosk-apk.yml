@@ -39,6 +39,15 @@ jobs:
           # navigator.wakeLock when Keep Screen On is off, so the screen can
           # sleep) — copy before the tag checkout so branch dispatches work.
           cp freekiosk-screen-wakelock-v1.2.19.patch /tmp/screen-wakelock.patch
+          # Patch-flags base + the 5 re-split feature patches (each ADB-toggleable
+          # via patch_* flags; see freekiosk-patch-flags). Copy them all out before
+          # the tag checkout so branch dispatches work.
+          cp freekiosk-patch-flags-v1.2.19.patch /tmp/patch-flags.patch
+          cp freekiosk-keep-screen-on-v1.2.19.patch /tmp/keep-screen-on.patch
+          cp freekiosk-keyboard-gap-v1.2.19.patch /tmp/keyboard-gap.patch
+          cp freekiosk-boot-splash-v1.2.19.patch /tmp/boot-splash.patch
+          cp freekiosk-force-text-keyboard-v1.2.19.patch /tmp/force-text.patch
+          cp freekiosk-gboard-ime-v1.2.19.patch /tmp/gboard.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -63,16 +72,34 @@ jobs:
           # works whether the build is dispatched from main or a feature branch.)
           git apply --3way --verbose --whitespace=nowarn /tmp/managed-config.patch
           git add -A
-          # Apply screen-wakelock fix LAST — it edits WebViewComponent.tsx and
-          # KioskScreen.tsx, which earlier patches already touch, so keep it after
-          # managed-config. Its hunks don't overlap the earlier patches' hunks, so
-          # --3way absorbs the line-offset shifts. Copied to /tmp before the tag
-          # checkout so branch dispatches work too.
+          # ---- ADB-toggleable feature patches -----------------------------------
+          # patch-flags is the base: it adds the ADB `patch_*` ingestion
+          # (MainActivity.handleAdbConfig) + KioskModule.getPatchFlags() the JS
+          # feature patches read, so it MUST come before the six features. The six
+          # are independent of each other; this order is chosen so files touched by
+          # more than one (MainActivity.kt: patch-flags/keep-screen-on/keyboard-gap;
+          # WebViewComponent.tsx: force-text/screen-wakelock; KioskScreen.tsx:
+          # gboard/screen-wakelock) apply as a stable sequence. Each defaults ON;
+          # disable via `adb ... --es config '{"patch_<name>":"false"}'`.
+          git apply --3way --verbose --whitespace=nowarn /tmp/patch-flags.patch
+          git add -A
+          git apply --3way --verbose --whitespace=nowarn /tmp/keep-screen-on.patch
+          git add -A
+          git apply --3way --verbose --whitespace=nowarn /tmp/keyboard-gap.patch
+          git add -A
+          git apply --3way --verbose --whitespace=nowarn /tmp/boot-splash.patch
+          git add -A
+          git apply --3way --verbose --whitespace=nowarn /tmp/force-text.patch
+          git add -A
+          git apply --3way --verbose --whitespace=nowarn /tmp/gboard.patch
+          git add -A
+          # screen-wakelock LAST — edits WebViewComponent.tsx / KioskScreen.tsx that
+          # force-text / gboard already touch; --3way absorbs the offset shifts.
           git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 51/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.28"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 52/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.29"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"

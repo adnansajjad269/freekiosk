@@ -1,0 +1,111 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index 290b5b8..4741bac 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -18,6 +18,7 @@ import { WebView } from 'react-native-webview';
+ import type { WebViewErrorEvent, ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
+ import { useNavigation } from '@react-navigation/native';
+ import PrintModule from '../utils/PrintModule';
++import KioskModule from '../utils/KioskModule';
+ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+ import type { RootStackParamList } from '../navigation/AppNavigator';
+ 
+@@ -80,6 +81,15 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   const [error, setError] = useState<boolean>(false);
+   const [pageLoaded, setPageLoaded] = useState<boolean>(false);
+   const [blockedUrlMessage, setBlockedUrlMessage] = useState<string | null>(null);
++  // PATCH patch_force_text (default ON, ADB-toggleable): gate the force_text
++  // keyboard mode. Defaults to true and stays true if getPatchFlags is absent
++  // (base patch not applied), so this feature patch works standalone.
++  const [forceTextPatchEnabled, setForceTextPatchEnabled] = useState<boolean>(true);
++  React.useEffect(() => {
++    KioskModule.getPatchFlags?.()
++      .then((flags) => setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false))
++      .catch(() => {});
++  }, []);
+   const blockedUrlTimerRef = useRef<any>(null);
+   const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
+   const fadeAnim = useRef(new Animated.Value(0)).current;
+@@ -597,6 +607,40 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+       `;
+     }
+ 
++    if (keyboardMode === 'force_text' && forceTextPatchEnabled) {
++      // PATCH patch_force_text: force a consistent ALPHABETIC keyboard on every
++      // text-like field, so e.g. an email field and a password field on the same
++      // login form present the same keyboard instead of the website/OS choosing
++      // different ones per field. Explicitly-numeric fields (type number/tel, or
++      // inputmode numeric/decimal/tel — e.g. an OTP box) are left untouched.
++      // Password fields stay masked (their type is not changed; only inputmode is
++      // set). When the patch flag is OFF this branch is skipped (behaves like
++      // 'default').
++      return `
++        (function() {
++          function forceTextKeyboard() {
++            const fields = document.querySelectorAll('input, textarea');
++            fields.forEach(function(input) {
++              const type = (input.type || '').toLowerCase();
++              const inputmode = (input.getAttribute('inputmode') || '').toLowerCase();
++              const isNumeric = type === 'number' || type === 'tel' ||
++                inputmode === 'numeric' || inputmode === 'decimal' || inputmode === 'tel';
++              if (type === 'hidden' || type === 'submit' || type === 'button' ||
++                  type === 'checkbox' || type === 'radio' || isNumeric) {
++                return;
++              }
++              input.setAttribute('inputmode', 'text');
++            });
++          }
++
++          forceTextKeyboard();
++
++          const observer = new MutationObserver(forceTextKeyboard);
++          observer.observe(document.body, { childList: true, subtree: true });
++        })();
++      `;
++    }
++
+     return '';
+   };
+ 
+diff --git a/src/screens/settings/tabs/DisplayTab.tsx b/src/screens/settings/tabs/DisplayTab.tsx
+index b7d714a..a54ddef 100644
+--- a/src/screens/settings/tabs/DisplayTab.tsx
++++ b/src/screens/settings/tabs/DisplayTab.tsx
+@@ -14,6 +14,7 @@ import {
+   SettingsInput,
+ } from '../../../components/settings';
+ import ScreenScheduleRuleCard from '../../../components/settings/ScreenScheduleRuleCard';
++import KioskModule from '../../../utils/KioskModule';
+ import { Colors, Spacing, Typography } from '../../../theme';
+ import { ScreenScheduleRule } from '../../../types/screenScheduler';
+ import type { MediaItem } from '../../../types/mediaPlayer';
+@@ -204,6 +205,17 @@ const DisplayTab: React.FC<DisplayTabProps> = ({
+   onAddScheduleRule,
+   onEditScheduleRule,
+ }) => {
++  // PATCH patch_force_text (default ON, ADB-toggleable): only surface the
++  // "Force Text / Unified" keyboard option when the patch flag is enabled.
++  // Defaults to true and stays true if getPatchFlags is absent, so this feature
++  // patch works standalone.
++  const [forceTextPatchEnabled, setForceTextPatchEnabled] = React.useState<boolean>(true);
++  React.useEffect(() => {
++    KioskModule.getPatchFlags?.()
++      .then((flags) => setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false))
++      .catch(() => {});
++  }, []);
++
+   const handleCameraPositionChange = (value: string) => {
+     if (value === 'front' || value === 'back') {
+       onMotionCameraPositionChange(value);
+@@ -913,6 +925,11 @@ const DisplayTab: React.FC<DisplayTabProps> = ({
+                 label: 'Smart Detection',
+                 hint: 'Detect and convert numeric fields only',
+               },
++              ...(forceTextPatchEnabled ? [{
++                value: 'force_text',
++                label: 'Force Text / Unified',
++                hint: 'All text fields (e.g. email + password) use the same alphabetic keyboard; numeric fields unaffected',
++              }] : []),
+             ]}
+             value={keyboardMode}
+             onValueChange={onKeyboardModeChange}

@@ -1,18 +1,18 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6635757..ebe789f 100644
+index 4741bac..d55791d 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
-@@ -23,10 +23,63 @@ import type { RootStackParamList } from '../navigation/AppNavigator';
+@@ -24,10 +24,63 @@ import type { RootStackParamList } from '../navigation/AppNavigator';
  
  type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
  
-+// #1 — When "Keep Screen On" is OFF the user expects the OS screen timeout to
-+// put the display to sleep. But the LAAM web app holds a Screen Wake Lock
-+// (navigator.wakeLock), which the Chromium WebView honors and which keeps the
-+// screen awake regardless of the window flag we clear natively. This script
-+// neutralizes it: it stubs navigator.wakeLock.request so any lock the page asks
-+// for is returned already-released (the system is never actually held awake),
-+// and releases anything currently held. The original request fn is stashed on
++// PATCH patch_wakelock — When "Keep Screen On" is OFF the user expects the OS
++// screen timeout to sleep the display. But the LAAM web app holds a Screen Wake
++// Lock (navigator.wakeLock), which the Chromium WebView honors and which keeps
++// the screen awake regardless of the native window flag. This script neutralizes
++// it: it stubs navigator.wakeLock.request so any lock the page asks for is
++// returned already-released (the system is never actually held awake), and
++// releases anything currently held. The original request fn is stashed on
 +// window.__fkWakeOrig so it can be restored if the setting is turned back on.
 +// Ends with `true;` to silence react-native-webview's injection warning.
 +const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -46,7 +46,7 @@ index 6635757..ebe789f 100644
 +`;
 +
 +// Restore the real navigator.wakeLock.request (used when "Keep Screen On" is
-+// switched back ON without a page reload).
++// switched back ON, or the patch is disabled, without a page reload).
 +const WAKE_LOCK_RESTORE_JS = `
 +(function(){
 +  try {
@@ -62,11 +62,11 @@ index 6635757..ebe789f 100644
    url: string;
    autoReload: boolean;
    keyboardMode?: string; // 'default', 'force_numeric', 'smart'
-+  keepScreenOn?: boolean; // when false, neutralize the page's navigator.wakeLock so the screen can sleep
++  keepScreenOn?: boolean; // when false (and patch_wakelock on), neutralize the page's navigator.wakeLock so the screen can sleep
    onUserInteraction?: (event?: { isTap?: boolean; x?: number; y?: number }) => void; // callback optionnel pour interaction utilisateur
    jsToExecute?: string; // JavaScript code to execute from API
    onJsExecuted?: () => void; // callback when JS is executed
-@@ -57,6 +110,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -58,6 +111,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
    url, 
    autoReload,
    keyboardMode = 'default',
@@ -74,36 +74,52 @@ index 6635757..ebe789f 100644
    onUserInteraction,
    jsToExecute,
    onJsExecuted,
-@@ -632,7 +686,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -85,9 +139,15 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   // keyboard mode. Defaults to true and stays true if getPatchFlags is absent
+   // (base patch not applied), so this feature patch works standalone.
+   const [forceTextPatchEnabled, setForceTextPatchEnabled] = useState<boolean>(true);
++  // PATCH patch_wakelock (default ON, ADB-toggleable): gate the wake-lock
++  // neutralizer. Defaults true and stays true if getPatchFlags is absent.
++  const [wakelockPatchEnabled, setWakelockPatchEnabled] = useState<boolean>(true);
+   React.useEffect(() => {
+     KioskModule.getPatchFlags?.()
+-      .then((flags) => setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false))
++      .then((flags) => {
++        setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false);
++        setWakelockPatchEnabled(flags?.patch_wakelock_enabled !== false);
++      })
+       .catch(() => {});
+   }, []);
+   const blockedUrlTimerRef = useRef<any>(null);
+@@ -644,7 +704,22 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      return '';
    };
  
 -  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript();
-+  // #1 — Inject the wake-lock neutralizer at page load only when Keep Screen On
-+  // is OFF. When ON (kiosk default) this contributes nothing, so page behavior
-+  // is unchanged.
++  // PATCH patch_wakelock: inject the wake-lock neutralizer at page load only when
++  // Keep Screen On is OFF and the patch is enabled. Otherwise contributes nothing.
++  const wakeLockActive = keepScreenOn === false && wakelockPatchEnabled;
 +  const getWakeLockOverrideScript = (): string => {
-+    return keepScreenOn === false ? WAKE_LOCK_NEUTRALIZE_JS : '';
++    return wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : '';
 +  };
 +
-+  // #1 — Apply the wake-lock override live when the setting toggles (or a pushed
-+  // config changes it), without waiting for a page reload. On the current page's
-+  // JS context: neutralize when turning OFF, restore the real API when turning ON.
++  // Apply the wake-lock override live when the setting/flag toggles, without
++  // waiting for a page reload: neutralize when active, restore otherwise.
 +  React.useEffect(() => {
 +    const wv = webViewRef.current;
 +    if (!wv) return;
-+    wv.injectJavaScript(keepScreenOn === false ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
-+  }, [keepScreenOn]);
++    wv.injectJavaScript(wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
++  }, [wakeLockActive]);
 +
 +  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript() + getWakeLockOverrideScript();
  
    // Gestion des messages venant de la webview
    const onMessageHandler = (event: any) => {
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index d8c4da5..c97e1d4 100644
+index 746446f..3bd07ed 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
-@@ -2434,6 +2434,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -2445,6 +2445,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
                url={url}
                autoReload={autoReload}
                keyboardMode={keyboardMode}
