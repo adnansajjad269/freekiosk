@@ -38,10 +38,10 @@ jobs:
           # Same for the slow-boot patch (keep-screen-on fix, boot-splash gate,
           # force_text keyboard mode) — copy it out before the tag checkout too.
           cp freekiosk-slow-boot-v1.2.19.patch /tmp/slow-boot.patch
-          # Same for the screen-keyboard patch (wake-lock neutralizer when Keep
-          # Screen On is off, + Gboard default-IME enforcement) — copy before the
-          # tag checkout so branch dispatches work.
-          cp freekiosk-screen-keyboard-v1.2.19.patch /tmp/screen-keyboard.patch
+          # Same for the screen-wakelock patch (neutralizes the page's
+          # navigator.wakeLock when Keep Screen On is off, so the screen can
+          # sleep) — copy before the tag checkout so branch dispatches work.
+          cp freekiosk-screen-wakelock-v1.2.19.patch /tmp/screen-wakelock.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -77,13 +77,12 @@ jobs:
           # the tag checkout so branch dispatches work too.
           git apply --3way --verbose --whitespace=nowarn /tmp/slow-boot.patch
           git add -A
-          # Apply screen-keyboard fixes LAST — diffed against a tree with all five
-          # prior patches applied (it edits WebViewComponent.tsx, KioskScreen.tsx,
-          # DisplayTab.tsx, KioskModule.kt/.ts, storage.ts, applyManagedConfig.ts,
-          # several of which earlier patches already touch). Keep it after
+          # Apply screen-wakelock fix LAST — diffed against a tree with all five
+          # prior patches applied (it edits WebViewComponent.tsx and
+          # KioskScreen.tsx, which earlier patches already touch). Keep it after
           # slow-boot. Copied to /tmp before the tag checkout so branch dispatches
           # work too.
-          git apply --3way --verbose --whitespace=nowarn /tmp/screen-keyboard.patch
+          git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
           sed -E -i 's/versionCode [0-9]+/versionCode 51/' android/app/build.gradle
