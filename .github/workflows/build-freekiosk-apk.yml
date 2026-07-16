@@ -24,7 +24,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Build from current branch source
         run: |
           echo "Building from branch: ${{ github.ref_name }}"
@@ -35,9 +34,6 @@ jobs:
           sed -E -i 's/versionName "[^"]+"/versionName "debug-insets"/' android/app/build.gradle
           
           grep -E "versionCode|versionName" android/app/build.gradle
-
-
-
 #      - name: Apply the patch on top of the chosen release tag
 #        run: |
 #          set -e
