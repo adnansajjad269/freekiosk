@@ -47,10 +47,6 @@ jobs:
           # Apply it
           git apply --verbose --whitespace=nowarn /tmp/battery-lock.patch
           git add -A
-          # Apply keyboard-gap fix (after battery patch - both touch MainActivity.kt)
-          git show origin/main:freekiosk-keyboard-gap-v1.2.19.patch > /tmp/keyboard-gap.patch
-          git apply --3way --verbose --whitespace=nowarn /tmp/keyboard-gap.patch
-          git add -A
           # Apply refresh button (touches WebViewComponent.tsx only - no overlap)
           git show origin/main:freekiosk-refresh-button-v1.2.19.patch > /tmp/refresh-button.patch
           git apply --3way --verbose --whitespace=nowarn /tmp/refresh-button.patch
