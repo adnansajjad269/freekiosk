@@ -35,9 +35,6 @@ jobs:
           # so the build works when dispatched from a feature branch too (the
           # patch may not be on origin/main yet).
           cp freekiosk-managed-config-v1.2.19.patch /tmp/managed-config.patch
-          # Same for the slow-boot patch (keep-screen-on fix, boot-splash gate,
-          # force_text keyboard mode) — copy it out before the tag checkout too.
-          cp freekiosk-slow-boot-v1.2.19.patch /tmp/slow-boot.patch
           # Same for the screen-wakelock patch (neutralizes the page's
           # navigator.wakeLock when Keep Screen On is off, so the screen can
           # sleep) — copy before the tag checkout so branch dispatches work.
@@ -70,18 +67,11 @@ jobs:
           # works whether the build is dispatched from main or a feature branch.)
           git apply --3way --verbose --whitespace=nowarn /tmp/managed-config.patch
           git add -A
-          # Apply slow-boot / display fixes LAST — it was diffed against a tree
-          # with all four prior patches applied (it edits MainActivity.kt and
-          # WebViewComponent.tsx, which battery-lock/keyboard-gap/refresh-button
-          # already touch). Keep it after managed-config. Copied to /tmp before
-          # the tag checkout so branch dispatches work too.
-          git apply --3way --verbose --whitespace=nowarn /tmp/slow-boot.patch
-          git add -A
-          # Apply screen-wakelock fix LAST — diffed against a tree with all five
-          # prior patches applied (it edits WebViewComponent.tsx and
-          # KioskScreen.tsx, which earlier patches already touch). Keep it after
-          # slow-boot. Copied to /tmp before the tag checkout so branch dispatches
-          # work too.
+          # Apply screen-wakelock fix LAST — it edits WebViewComponent.tsx and
+          # KioskScreen.tsx, which earlier patches already touch, so keep it after
+          # managed-config. Its hunks don't overlap the earlier patches' hunks, so
+          # --3way absorbs the line-offset shifts. Copied to /tmp before the tag
+          # checkout so branch dispatches work too.
           git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
