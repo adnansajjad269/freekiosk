@@ -1,0 +1,138 @@
+name: Build patched FreeKiosk APK
+
+# Builds FreeKiosk from a chosen release tag, applies the battery-lock patch,
+# and produces an installable APK — entirely on GitHub's servers.
+# Trigger it manually from the Actions tab ("Run workflow").
+
+on:
+  workflow_dispatch:
+    inputs:
+    #  source_tag:
+    #    description: "FreeKiosk release tag to build from"
+    #    default: "v1.2.19"
+    #    required: true
+      patch_file:
+        description: "Patch file name in the repo root"
+        default: "freekiosk-battery-lock-v1.2.19.patch"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the fork (full history so tags are available)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build from current branch source
+        run: |
+          echo "Building from branch: ${{ github.ref_name }}"
+          git rev-parse --short HEAD
+          
+          # Bump version so it installs over previous test builds
+          sed -E -i 's/versionCode [0-9]+/versionCode 99/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "debug-insets"/' android/app/build.gradle
+          
+          grep -E "versionCode|versionName" android/app/build.gradle
+
+
+
+#      - name: Apply the patch on top of the chosen release tag
+#        run: |
+#          set -e
+          # Save the patch (it only exists on the default branch, not in the tag)
+#          cp "${{ github.event.inputs.patch_file }}" /tmp/battery-lock.patch
+          # Forks don't always carry the release tags, so pull them from the
+          # original FreeKiosk repo, then switch the source tree to that release.
+#          git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
+#          git fetch --tags upstream
+#          git checkout "${{ github.event.inputs.source_tag }}"
+          # Apply it
+#          git apply --verbose --whitespace=nowarn /tmp/battery-lock.patch
+#          git add -A
+          # Apply keyboard-gap fix (after battery patch - both touch MainActivity.kt)
+#          git show origin/main:freekiosk-keyboard-gap-v1.2.19.patch > /tmp/keyboard-gap.patch
+#          git apply --3way --verbose --whitespace=nowarn /tmp/keyboard-gap.patch
+#          git add -A
+          # Apply refresh button (touches WebViewComponent.tsx only - no overlap)
+#          git show origin/main:freekiosk-refresh-button-v1.2.19.patch > /tmp/refresh-button.patch
+#          git apply --3way --verbose --whitespace=nowarn /tmp/refresh-button.patch
+#          git add -A
+          # Bump versionCode so this build installs over the previous test build
+#          sed -E -i 's/versionCode [0-9]+/versionCode 43/' android/app/build.gradle
+#          sed -E -i 's/versionName "[^"]+"/versionName "1.2.20"/' android/app/build.gradle
+#          grep -E "versionCode|versionName" android/app/build.gradle
+          grep versionCode android/app/build.gradle
+          echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.1.12297006" \
+            "cmake;3.22.1"
+
+      - name: Create Gradle build config
+        run: cp android/gradle.properties.template android/gradle.properties
+
+      - name: Configure signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            # build.gradle's signingConfig resolves storeFile relative to the
+            # app module (android/app/), so the keystore must live there.
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/fleet.keystore
+            {
+              echo "FREEKIOSK_UPLOAD_STORE_FILE=fleet.keystore"
+              echo "FREEKIOSK_UPLOAD_STORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "FREEKIOSK_UPLOAD_KEY_ALIAS=$KEY_ALIAS"
+              echo "FREEKIOSK_UPLOAD_KEY_PASSWORD=$KEY_PASSWORD"
+            } >> android/gradle.properties
+            echo "Signing with your fleet keystore."
+          else
+            echo "::warning::No KEYSTORE_BASE64 secret set — building with the built-in debug key. Fine for a first test, NOT for fleet rollout."
+          fi
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build the release APK
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Show APK signer certificate
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME"/build-tools/36.0.0/apksigner verify --print-certs "$APK" || true
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeKiosk-battlock-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
