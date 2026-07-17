@@ -1,0 +1,115 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index 6d11716..e6f957d 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -15,7 +15,7 @@ import {
+ const { HttpServerModule } = NativeModules;
+ 
+ import { WebView } from 'react-native-webview';
+-import type { WebViewErrorEvent, ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
++import type { WebViewErrorEvent, ShouldStartLoadRequest, WebViewRenderProcessGoneEvent } from 'react-native-webview/lib/WebViewTypes';
+ import { useNavigation } from '@react-navigation/native';
+ import PrintModule from '../utils/PrintModule';
+ import KioskModule from '../utils/KioskModule';
+@@ -97,6 +97,7 @@ interface WebViewComponentProps {
+   disableUserZoom?: boolean; // Prevent pinch-to-zoom and double-tap zoom
+   customUserAgent?: string; // Custom User-Agent string (empty = default modern Chrome UA)
+   basicAuthCredential?: { username: string; password: string };
++  onRenderProcessGone?: (didCrash: boolean) => void; // #198 — renderer process died, ask parent to remount
+ }
+ 
+ export interface WebViewComponentRef {
+@@ -128,6 +129,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   disableUserZoom = false,
+   customUserAgent = '',
+   basicAuthCredential,
++  onRenderProcessGone,
+ }, ref) => {
+   const navigation = useNavigation<NavigationProp>();
+   const webViewRef = useRef<WebView>(null);
+@@ -773,6 +775,25 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+     }
+   };
+ 
++  // #198 — The Chromium renderer process died (typically an OOM kill). The native
++  // RNCWebViewClient already returns true so the app process survives, but the WebView
++  // instance is now defunct (blank white screen) and, per Android's contract, must be
++  // remounted rather than reused. Best-effort clear the WebView cache to rebuild the
++  // corrupted Chromium code-cache index, then ask the parent to bump webViewKey for a
++  // full remount (same recovery pattern as inactivity return / planner).
++  const handleRenderProcessGone = (event: WebViewRenderProcessGoneEvent): void => {
++    const didCrash = !!event?.nativeEvent?.didCrash;
++    console.error('[FreeKiosk] WebView renderer process gone (didCrash=' + didCrash + '), recovering...');
++    try {
++      webViewRef.current?.clearCache(true);
++    } catch {
++      // Defunct WebView — clearing may throw; the remount below is the real recovery.
++    }
++    if (onRenderProcessGone) {
++      onRenderProcessGone(didCrash);
++    }
++  };
++
+   const handleReload = (): void => {
+     setError(false);
+     setLoading(true);
+@@ -931,6 +952,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+           }
+         }}
+         onError={handleError}
++        onRenderProcessGone={handleRenderProcessGone}
+ 
+         javaScriptEnabled={true}
+         domStorageEnabled={true}
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index c97e1d4..f83680f 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -167,6 +167,10 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+ 
+   // WebView reload key - increment to force reload
+   const [webViewKey, setWebViewKey] = useState<number>(0);
++  // #198 — guard against a renderer crash-loop: track consecutive renderer-gone
++  // remounts within a short window so a WebView that dies immediately on every
++  // load doesn't get hammered into an infinite tight remount loop.
++  const rendererGoneRef = useRef<{ last: number; count: number }>({ last: 0, count: 0 });
+   
+   // JavaScript to execute in WebView (from API) - use object with counter to handle same code twice
+   const [jsToExecute, setJsToExecute] = useState<string>('');
+@@ -1944,6 +1948,28 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+     lastUserInteractionRef.current = Date.now();
+   }, []);
+ 
++  // #198 — WebView renderer process died (white screen). Force a full remount of the
++  // WebView (new native instance, as Android requires after onRenderProcessGone). A
++  // crash-loop guard backs off to a delayed remount if the renderer dies repeatedly in
++  // quick succession, so a page that crashes on every load can't pin the CPU.
++  const handleWebViewRenderProcessGone = useCallback((didCrash: boolean) => {
++    const now = Date.now();
++    const g = rendererGoneRef.current;
++    // Reset the streak if the last crash was a while ago (recovery considered stable).
++    if (now - g.last > 30000) {
++      g.count = 0;
++    }
++    g.last = now;
++    g.count += 1;
++    console.warn(`[KioskScreen] WebView renderer gone (didCrash=${didCrash}), remount #${g.count}`);
++    if (g.count > 3) {
++      // Repeated rapid crashes — back off before remounting to avoid a tight loop.
++      setTimeout(() => setWebViewKey(prev => prev + 1), 5000);
++    } else {
++      setWebViewKey(prev => prev + 1);
++    }
++  }, []);
++
+   // Single useEffect that manages the inactivity return timer
+   // It re-runs whenever relevant state changes
+   useEffect(() => {
+@@ -2466,6 +2492,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+                   ? { username: basicAuthUsername, password: basicAuthPassword }
+                   : undefined
+               }
++              onRenderProcessGone={handleWebViewRenderProcessGone}
+             />
+           )}
+         </>

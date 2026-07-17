@@ -47,6 +47,7 @@ jobs:
           cp freekiosk-keyboard-fix-v1.2.19.patch /tmp/keyboard-fix.patch
           cp freekiosk-boot-splash-v1.2.19.patch /tmp/boot-splash.patch
           cp freekiosk-refresh-button-v1.2.19.patch /tmp/refresh-button.patch
+          cp freekiosk-webview-render-recovery-v1.2.19.patch /tmp/webview-render-recovery.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -102,9 +103,19 @@ jobs:
           # effect, so it applies cleanly on its own.
           git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
           git add -A
+          # webview-render-recovery — backport of upstream commit 9ffdc7b (#198),
+          # which landed after v1.2.19: when the Chromium renderer process dies
+          # (typically an OOM kill) the WebView goes defunct — a blank white
+          # screen that only a reload/remount clears. This wires
+          # onRenderProcessGone -> full WebView remount (webViewKey bump) with a
+          # crash-loop backoff. Applied LAST: it touches WebViewComponent.tsx and
+          # KioskScreen.tsx, which screen-wakelock also edits, and was diffed
+          # against the post-wakelock tree.
+          git apply --3way --verbose --whitespace=nowarn /tmp/webview-render-recovery.patch
+          git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 54/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.31"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 55/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.32"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
