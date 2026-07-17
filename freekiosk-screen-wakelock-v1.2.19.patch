@@ -1,8 +1,14 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 4741bac..d55791d 100644
+index 290b5b8..6d11716 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
-@@ -24,10 +24,63 @@ import type { RootStackParamList } from '../navigation/AppNavigator';
+@@ -18,15 +18,69 @@ import { WebView } from 'react-native-webview';
+ import type { WebViewErrorEvent, ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
+ import { useNavigation } from '@react-navigation/native';
+ import PrintModule from '../utils/PrintModule';
++import KioskModule from '../utils/KioskModule';
+ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+ import type { RootStackParamList } from '../navigation/AppNavigator';
  
  type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
  
@@ -66,32 +72,35 @@ index 4741bac..d55791d 100644
    onUserInteraction?: (event?: { isTap?: boolean; x?: number; y?: number }) => void; // callback optionnel pour interaction utilisateur
    jsToExecute?: string; // JavaScript code to execute from API
    onJsExecuted?: () => void; // callback when JS is executed
-@@ -58,6 +111,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
-   url, 
+@@ -54,9 +108,10 @@ export interface WebViewComponentRef {
+ }
+ 
+ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(({ 
+-  url, 
++  url,
    autoReload,
    keyboardMode = 'default',
 +  keepScreenOn = true,
    onUserInteraction,
    jsToExecute,
    onJsExecuted,
-@@ -85,9 +139,15 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
-   // keyboard mode. Defaults to true and stays true if getPatchFlags is absent
-   // (base patch not applied), so this feature patch works standalone.
-   const [forceTextPatchEnabled, setForceTextPatchEnabled] = useState<boolean>(true);
+@@ -80,6 +135,15 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   const [error, setError] = useState<boolean>(false);
+   const [pageLoaded, setPageLoaded] = useState<boolean>(false);
+   const [blockedUrlMessage, setBlockedUrlMessage] = useState<string | null>(null);
 +  // PATCH patch_wakelock (default ON, ADB-toggleable): gate the wake-lock
-+  // neutralizer. Defaults true and stays true if getPatchFlags is absent.
++  // neutralizer. Defaults true and stays true if getPatchFlags is absent (base
++  // patch not applied), so this feature patch works standalone.
 +  const [wakelockPatchEnabled, setWakelockPatchEnabled] = useState<boolean>(true);
-   React.useEffect(() => {
-     KioskModule.getPatchFlags?.()
--      .then((flags) => setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false))
-+      .then((flags) => {
-+        setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false);
-+        setWakelockPatchEnabled(flags?.patch_wakelock_enabled !== false);
-+      })
-       .catch(() => {});
-   }, []);
++  React.useEffect(() => {
++    KioskModule.getPatchFlags?.()
++      .then((flags) => setWakelockPatchEnabled(flags?.patch_wakelock_enabled !== false))
++      .catch(() => {});
++  }, []);
    const blockedUrlTimerRef = useRef<any>(null);
-@@ -644,7 +704,22 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
+   const fadeAnim = useRef(new Animated.Value(0)).current;
+@@ -600,7 +664,22 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      return '';
    };
  
@@ -116,10 +125,10 @@ index 4741bac..d55791d 100644
    // Gestion des messages venant de la webview
    const onMessageHandler = (event: any) => {
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index 746446f..3bd07ed 100644
+index d8c4da5..c97e1d4 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
-@@ -2445,6 +2445,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -2434,6 +2434,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
                url={url}
                autoReload={autoReload}
                keyboardMode={keyboardMode}

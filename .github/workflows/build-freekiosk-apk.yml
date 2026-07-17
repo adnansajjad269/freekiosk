@@ -46,8 +46,6 @@ jobs:
           cp freekiosk-keep-screen-on-v1.2.19.patch /tmp/keep-screen-on.patch
           cp freekiosk-keyboard-fix-v1.2.19.patch /tmp/keyboard-fix.patch
           cp freekiosk-boot-splash-v1.2.19.patch /tmp/boot-splash.patch
-          cp freekiosk-force-text-keyboard-v1.2.19.patch /tmp/force-text.patch
-          cp freekiosk-gboard-ime-v1.2.19.patch /tmp/gboard.patch
           cp freekiosk-refresh-button-v1.2.19.patch /tmp/refresh-button.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
@@ -77,12 +75,11 @@ jobs:
           # ---- ADB-toggleable feature patches -----------------------------------
           # patch-flags is the base: it adds the ADB `patch_*` ingestion
           # (MainActivity.handleAdbConfig) + KioskModule.getPatchFlags() the JS
-          # feature patches read, so it MUST come before the six features. The six
-          # are independent of each other; this order is chosen so files touched by
-          # more than one (MainActivity.kt: patch-flags/keep-screen-on/keyboard-fix;
-          # WebViewComponent.tsx: force-text/screen-wakelock; KioskScreen.tsx:
-          # gboard/screen-wakelock) apply as a stable sequence. Each defaults ON;
-          # disable via `adb ... --es config '{"patch_<name>":"false"}'`.
+          # feature patches read, so it MUST come before the features. This order
+          # is chosen so files touched by more than one (MainActivity.kt:
+          # patch-flags/keep-screen-on/keyboard-fix) apply as a stable sequence.
+          # Each defaults ON; disable via
+          # `adb ... --es config '{"patch_<name>":"false"}'`.
           git apply --3way --verbose --whitespace=nowarn /tmp/patch-flags.patch
           git add -A
           git apply --3way --verbose --whitespace=nowarn /tmp/keep-screen-on.patch
@@ -98,17 +95,16 @@ jobs:
           git add -A
           git apply --3way --verbose --whitespace=nowarn /tmp/boot-splash.patch
           git add -A
-          git apply --3way --verbose --whitespace=nowarn /tmp/force-text.patch
-          git add -A
-          git apply --3way --verbose --whitespace=nowarn /tmp/gboard.patch
-          git add -A
-          # screen-wakelock LAST — edits WebViewComponent.tsx / KioskScreen.tsx that
-          # force-text / gboard already touch; --3way absorbs the offset shifts.
+          # screen-wakelock LAST — neutralizes the page's navigator.wakeLock when
+          # Keep Screen On is off. Regenerated as standalone after force-text and
+          # gboard were dropped from this build: its WebViewComponent.tsx hunk no
+          # longer piggybacks on force-text's KioskModule import / getPatchFlags
+          # effect, so it applies cleanly on its own.
           git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 53/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.30"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 54/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.31"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
