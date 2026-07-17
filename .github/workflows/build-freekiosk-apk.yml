@@ -48,6 +48,7 @@ jobs:
           cp freekiosk-boot-splash-v1.2.19.patch /tmp/boot-splash.patch
           cp freekiosk-refresh-button-v1.2.19.patch /tmp/refresh-button.patch
           cp freekiosk-webview-render-recovery-v1.2.19.patch /tmp/webview-render-recovery.patch
+          cp freekiosk-camera-teardown-v1.2.19.patch /tmp/camera-teardown.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -113,9 +114,24 @@ jobs:
           # against the post-wakelock tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/webview-render-recovery.patch
           git add -A
+          # camera-teardown — root-cause fixes for camera contention with the
+          # WebView's getUserMedia scanner (Kyocera DuraForce2):
+          # (1) vision-camera is now lazy-required and MotionDetector only mounts
+          #     when the motion feature is enabled, so a kiosk with motion off
+          #     makes ZERO camera-service calls (previously CameraDevicesManager
+          #     registered a permanent availability callback at every launch);
+          # (2) CameraPhotoModule releases every camera resource in a finally
+          #     block and reaps a camera that finishes opening after the 5s
+          #     timeout — previously that device leaked open, wedging the camera
+          #     for every app until reboot;
+          # (3) log-only getUserMedia diagnostics ([FreeKioskCam] in logcat).
+          # Applied LAST: touches WebViewComponent.tsx + KioskScreen.tsx like the
+          # patches above; diffed against the post-recovery tree.
+          git apply --3way --verbose --whitespace=nowarn /tmp/camera-teardown.patch
+          git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 55/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.32"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 56/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.33"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"

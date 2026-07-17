@@ -1,0 +1,262 @@
+diff --git a/android/app/src/main/java/com/freekiosk/CameraPhotoModule.kt b/android/app/src/main/java/com/freekiosk/CameraPhotoModule.kt
+index c8e31a4..924d926 100644
+--- a/android/app/src/main/java/com/freekiosk/CameraPhotoModule.kt
++++ b/android/app/src/main/java/com/freekiosk/CameraPhotoModule.kt
+@@ -61,6 +61,21 @@ class CameraPhotoModule(private val context: Context) {
+         var resultStream: ByteArrayInputStream? = null
+         val latch = CountDownLatch(1)
+ 
++        // #camera-teardown: every camera resource is tracked here and released in
++        // the finally block, so no path — open timeout, session timeout, null
++        // result, or exception — can leak an open CameraDevice. On legacy HALs
++        // (Kyocera DuraForce2 / Android 10) a leaked open camera wedges the whole
++        // camera service for every app until the device is rebooted.
++        // trackedCamera is an AtomicReference because onOpened() runs on the
++        // camera handler thread and can race the caller's open-timeout path;
++        // getAndSet(null) makes close() exactly-once whichever side wins.
++        val trackedCamera = java.util.concurrent.atomic.AtomicReference<CameraDevice?>(null)
++        val openAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
++        var trackedReader: ImageReader? = null
++        var trackedSession: CameraCaptureSession? = null
++        var trackedSurface: android.view.Surface? = null
++        var trackedTexture: SurfaceTexture? = null
++
+         try {
+             // Get optimal image size
+             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+@@ -75,6 +90,7 @@ class CameraPhotoModule(private val context: Context) {
+             val imageReader = ImageReader.newInstance(
+                 targetSize.width, targetSize.height, ImageFormat.JPEG, 1
+             )
++            trackedReader = imageReader
+ 
+             imageReader.setOnImageAvailableListener({ reader ->
+                 val image = reader.acquireLatestImage()
+@@ -102,6 +118,15 @@ class CameraPhotoModule(private val context: Context) {
+             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                 override fun onOpened(camera: CameraDevice) {
+                     cameraDevice = camera
++                    trackedCamera.set(camera)
++                    if (openAbandoned.get()) {
++                        // The caller stopped waiting (slow HAL cold start). Close the
++                        // late-arriving device instead of leaking it — a leaked open
++                        // camera blocks every other client until reboot.
++                        Log.w(TAG, "Camera opened after timeout — closing abandoned device")
++                        trackedCamera.getAndSet(null)?.close()
++                        return
++                    }
+                     cameraLatch.countDown()
+                 }
+ 
+@@ -120,22 +145,26 @@ class CameraPhotoModule(private val context: Context) {
+ 
+             // Wait for camera to open
+             if (!cameraLatch.await(5, TimeUnit.SECONDS)) {
++                openAbandoned.set(true)
+                 Log.e(TAG, "Timeout waiting for camera to open")
+-                handlerThread.quitSafely()
++                // If onOpened() raced us and already registered the device, close it
++                // now; otherwise the abandoned-open guard in onOpened() closes it.
++                trackedCamera.getAndSet(null)?.close()
+                 return null
+             }
+ 
+             val camera = cameraDevice
+             if (camera == null) {
+                 Log.e(TAG, "Camera failed to open")
+-                handlerThread.quitSafely()
+                 return null
+             }
+ 
+             // Create a dummy surface for preview (required by some devices)
+             val dummyTexture = SurfaceTexture(0)
++            trackedTexture = dummyTexture
+             dummyTexture.setDefaultBufferSize(targetSize.width, targetSize.height)
+             val dummySurface = android.view.Surface(dummyTexture)
++            trackedSurface = dummySurface
+             
+             val surfaces = listOf(dummySurface, imageReader.surface)
+ 
+@@ -146,6 +175,7 @@ class CameraPhotoModule(private val context: Context) {
+             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                 override fun onConfigured(session: CameraCaptureSession) {
+                     captureSession = session
++                    trackedSession = session
+                     sessionLatch.countDown()
+                 }
+ 
+@@ -159,20 +189,12 @@ class CameraPhotoModule(private val context: Context) {
+             // Wait for session
+             if (!sessionLatch.await(5, TimeUnit.SECONDS)) {
+                 Log.e(TAG, "Timeout waiting for capture session")
+-                camera.close()
+-                dummySurface.release()
+-                dummyTexture.release()
+-                handlerThread.quitSafely()
+                 return null
+             }
+ 
+             val session = captureSession
+             if (session == null) {
+                 Log.e(TAG, "Capture session failed")
+-                camera.close()
+-                dummySurface.release()
+-                dummyTexture.release()
+-                handlerThread.quitSafely()
+                 return null
+             }
+ 
+@@ -224,12 +246,8 @@ class CameraPhotoModule(private val context: Context) {
+                 Log.e(TAG, "Timeout waiting for photo capture")
+             }
+ 
+-            // Cleanup
+-            session.close()
+-            camera.close()
+-            imageReader.close()
+-            dummySurface.release()
+-            dummyTexture.release()
++            // Cleanup happens in the finally block — a single release path shared
++            // by every outcome (success, timeout, exception).
+ 
+         } catch (e: SecurityException) {
+             Log.e(TAG, "Camera permission denied: ${e.message}")
+@@ -238,6 +256,14 @@ class CameraPhotoModule(private val context: Context) {
+         } catch (e: Exception) {
+             Log.e(TAG, "Unexpected error during capture: ${e.message}", e)
+         } finally {
++            // Idempotent release of every tracked resource. close()/release() on an
++            // already-closed camera2 object is a documented no-op, and the callbacks
++            // above may have closed some of these already.
++            try { trackedSession?.close() } catch (_: Exception) {}
++            try { trackedCamera.getAndSet(null)?.close() } catch (_: Exception) {}
++            try { trackedReader?.close() } catch (_: Exception) {}
++            try { trackedSurface?.release() } catch (_: Exception) {}
++            try { trackedTexture?.release() } catch (_: Exception) {}
+             handlerThread.quitSafely()
+         }
+ 
+diff --git a/src/components/MotionDetector.tsx b/src/components/MotionDetector.tsx
+index a295e0f..70e70f2 100644
+--- a/src/components/MotionDetector.tsx
++++ b/src/components/MotionDetector.tsx
+@@ -1,6 +1,7 @@
+ import React, { useRef, useEffect, useState, useCallback } from 'react';
+ import { View, StyleSheet } from 'react-native';
+-import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
++// #camera-teardown: type-only import — erased at compile time, triggers no native init.
++import type { Camera } from 'react-native-vision-camera';
+ import MotionDetectionModule from '../utils/MotionDetectionModule';
+ import { httpServer } from '../utils/HttpServerModule';
+ 
+@@ -34,6 +35,21 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+   cameraPosition = 'front',
+   onStatusChange,
+ }) => {
++  // #camera-teardown: require vision-camera lazily, inside the component body.
++  // A static import initializes the native CameraDevicesManager the moment the
++  // JS module evaluates — it registers a CameraManager availability callback and
++  // enumerates every camera with full characteristics, a permanent same-process
++  // camera-service hook that exists even when motion detection is disabled. On
++  // legacy HALs (Kyocera DuraForce2 / Android 10) that dormant hook can interfere
++  // with the WebView's getUserMedia. KioskScreen only mounts this component when
++  // the motion feature is enabled, so with motion off the app now makes zero
++  // camera-service calls. require() is cached, so the destructured hooks keep
++  // stable identities across renders and the rules of hooks hold.
++  const {
++    Camera: VisionCamera,
++    useCameraDevice,
++    useCameraPermission,
++  } = require('react-native-vision-camera') as typeof import('react-native-vision-camera');
+   const device = useCameraDevice(cameraPosition);
+   const { hasPermission } = useCameraPermission();
+   const cameraRef = useRef<Camera>(null);
+@@ -372,7 +388,7 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+ 
+   return (
+     <View style={styles.container} pointerEvents="none">
+-      <Camera
++      <VisionCamera
+         ref={cameraRef}
+         style={styles.camera}
+         device={device}
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index e6f957d..6be3b4f 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -76,6 +76,33 @@ const WAKE_LOCK_RESTORE_JS = `
+ true;
+ `;
+ 
++// #camera-teardown diagnostics: log every getUserMedia call and failure (error
++// name + message + duration) so camera-start failures on device are visible via
++// `adb logcat` (ReactNativeJS tag). Log-only — no retry, no behavior change.
++// Installed at document start so it wraps before any page script runs.
++const CAMERA_DIAG_JS = `
++(function(){
++  try {
++    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
++    if (navigator.mediaDevices.__fkCamDiag) return;
++    navigator.mediaDevices.__fkCamDiag = true;
++    var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
++    navigator.mediaDevices.getUserMedia = function(constraints){
++      var t0 = Date.now();
++      try { console.log('[FreeKioskCam] getUserMedia start ' + JSON.stringify(constraints)); } catch(e) {}
++      return orig(constraints).then(function(stream){
++        console.log('[FreeKioskCam] getUserMedia OK in ' + (Date.now()-t0) + 'ms');
++        return stream;
++      }, function(err){
++        console.log('[FreeKioskCam] getUserMedia FAILED in ' + (Date.now()-t0) + 'ms: ' + (err && err.name) + ' - ' + (err && err.message));
++        throw err;
++      });
++    };
++  } catch(e){}
++})();
++true;
++`;
++
+ interface WebViewComponentProps {
+   url: string;
+   autoReload: boolean;
+@@ -953,6 +980,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+         }}
+         onError={handleError}
+         onRenderProcessGone={handleRenderProcessGone}
++        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
+ 
+         javaScriptEnabled={true}
+         domStorageEnabled={true}
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index f83680f..e76bd9d 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -2548,13 +2548,22 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+         />
+       )}
+ 
+-      {/* Motion Detector - Active during pre-check OR when screensaver is ON (only if screen is focused) */}
+-      <MotionDetector
+-        enabled={isFocused && (motionAlwaysOn || (motionEnabled && (isPreCheckingMotion || isScreensaverActive)))}
+-        onMotionDetected={onMotionDetected}
+-        sensitivity={motionSensitivity}
+-        cameraPosition={motionCameraPosition}
+-      />
++      {/* Motion Detector - Active during pre-check OR when screensaver is ON (only if screen is focused).
++          #camera-teardown: mounted ONLY when the motion feature is enabled. Mounting it
++          unconditionally ran vision-camera's useCameraDevice() on every launch, which
++          initialized the native CameraDevicesManager (availability callback + full camera
++          enumeration) even on kiosks that never use motion detection — a dormant
++          same-process camera-service hook that can interfere with the WebView's
++          getUserMedia on legacy HALs (Kyocera DuraForce2). With the feature off, the
++          app now makes zero camera-service calls. */}
++      {(motionAlwaysOn || motionEnabled) && (
++        <MotionDetector
++          enabled={isFocused && (motionAlwaysOn || (motionEnabled && (isPreCheckingMotion || isScreensaverActive)))}
++          onMotionDetected={onMotionDetected}
++          sensitivity={motionSensitivity}
++          cameraPosition={motionCameraPosition}
++        />
++      )}
+ 
+       {/* Visual Button - WebView/Media mode only */}
+       {/* In button mode: button always clickable, visibility controlled by opacity */}
