@@ -1,0 +1,2351 @@
+diff --git a/App.tsx b/App.tsx
+index 40635ce..42bcb67 100644
+--- a/App.tsx
++++ b/App.tsx
+@@ -1,8 +1,12 @@
+ import React from 'react';
+ import { StatusBar } from 'react-native';
+ import AppNavigator from './src/navigation/AppNavigator';
++import { useManagedConfigSync } from './src/hooks/useManagedConfigSync';
+ 
+ const App: React.FC = () => {
++  // Apply Headwind MDM managed configuration (App Restrictions) at app root.
++  useManagedConfigSync();
++
+   return (
+     <>
+       <StatusBar hidden={true} />
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index dd734ec..3964384 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -94,6 +94,13 @@ android {
+     compileSdk rootProject.ext.compileSdkVersion
+ 
+     namespace "com.freekiosk"
++
++    // AGP disables AIDL codegen by default; required to compile the vendored
++    // com.hmdm.IMdmApi.aidl (Headwind MDM client lib, used by ManagedConfigModule).
++    buildFeatures {
++        aidl true
++    }
++
+     defaultConfig {
+         applicationId "com.freekiosk"
+         minSdkVersion rootProject.ext.minSdkVersion
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index cddfb5a..89bf835 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -50,6 +50,12 @@
+         <intent>
+             <action android:name="android.intent.action.MAIN" />
+         </intent>
++        <!-- Explicit visibility of the Headwind MDM launcher so the vendored
++             com.hmdm client lib can bind to its PluginApiService (AIDL) and
++             resolve its admin component. Package-visibility rules on Android
++             11+ (targetSdk 30+) otherwise make getApplicationInfo() throw
++             NameNotFoundException, silently breaking all managed-config acks. -->
++        <package android:name="com.hmdm.launcher" />
+     </queries>
+ 
+     <application
+diff --git a/android/app/src/main/aidl/com/hmdm/IMdmApi.aidl b/android/app/src/main/aidl/com/hmdm/IMdmApi.aidl
+new file mode 100644
+index 0000000..b6101cf
+--- /dev/null
++++ b/android/app/src/main/aidl/com/hmdm/IMdmApi.aidl
+@@ -0,0 +1,62 @@
++// IMdmApi.aidl
++package com.hmdm;
++
++// Declare any non-default types here with import statements
++
++interface IMdmApi {
++    /**
++     * Get the MDM configuration (non-privileged, no sensitive info)
++     */
++    Bundle queryConfig();
++
++    /**
++     * Send a log message
++     */
++    void log(long timestamp, int level, String packageId, String message);
++
++    /**
++     * Get app preference
++     */
++    String queryAppPreference(String packageId, String attr);
++
++    /**
++     * Set app preference
++     */
++    boolean setAppPreference(String packageId, String attr, String value);
++
++    /**
++     * Send app preferences to server
++     */
++    void commitAppPreferences(String packageId);
++
++    // Added in library version 1.1.3
++    // All new methods should be added at the end of the AIDL file!!!
++
++    /**
++     * Get the API version supported by the launcher (1.1.3 = 113)
++     */
++    int getVersion();
++
++    /**
++     * Get the MDM configuration (privileged, including IMEI and serial number)
++     */
++    Bundle queryPrivilegedConfig(String apiKey);
++
++    /**
++     * Set a custom field to send it to the server
++     */
++    void setCustom(int number, String value);
++
++    // Added in library version 1.1.5
++    /**
++     * Force the configuration update
++     */
++    void forceConfigUpdate();
++
++    // Added in library version 1.1.8
++    /**
++     * Send a Push notification to initiate an action from the app
++     * Returns true on success and false if the api key is invalid
++     */
++    boolean sendPush(String apiKey, String type, String payload);
++}
+diff --git a/android/app/src/main/java/com/freekiosk/MainApplication.kt b/android/app/src/main/java/com/freekiosk/MainApplication.kt
+index a1a693a..26d3205 100644
+--- a/android/app/src/main/java/com/freekiosk/MainApplication.kt
++++ b/android/app/src/main/java/com/freekiosk/MainApplication.kt
+@@ -32,6 +32,7 @@ class MainApplication : Application(), ReactApplication {
+           add(AutoBrightnessPackage())
+           add(PrintPackage())
+           add(AccessibilityPackage())
++          add(ManagedConfigPackage())
+           add(FilePickerPackage())
+         },
+     )
+diff --git a/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
+new file mode 100644
+index 0000000..1c9d2e2
+--- /dev/null
++++ b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
+@@ -0,0 +1,305 @@
++package com.freekiosk
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.os.Parcelable
++import android.os.UserManager
++import android.util.Log
++import com.facebook.react.bridge.Arguments
++import com.facebook.react.bridge.Promise
++import com.facebook.react.bridge.ReactApplicationContext
++import com.facebook.react.bridge.ReactContextBaseJavaModule
++import com.facebook.react.bridge.ReactMethod
++import com.facebook.react.bridge.WritableArray
++import com.facebook.react.bridge.WritableMap
++import com.facebook.react.modules.core.DeviceEventManagerModule
++import com.hmdm.HeadwindMDM
++import com.hmdm.MDMService
++
++/**
++ * Bridges Android Managed Configurations (App Restrictions) — pushed by the
++ * Headwind MDM launcher (device owner) via setApplicationRestrictions() — into
++ * FreeKiosk's JS layer, and reports an applied-config acknowledgement back to
++ * the launcher via the vendored com.hmdm client lib (setCustom → device custom
++ * fields → server sync).
++ *
++ * JS API:
++ *   ManagedConfig.getConfig(): Promise<object>       current restrictions bundle
++ *   ManagedConfig.reportCustom(slot, value): Promise  ack via HeadwindMDM.setCustom
++ *   ManagedConfig.logRemote(level, message)           fire-and-forget; forwards to the
++ *                                                      launcher's remote-log pipeline via
++ *                                                      MDMService.Log (also logs locally).
++ *                                                      Only reaches the webconsole's Device
++ *                                                      Log tab if a server-side log rule
++ *                                                      matches com.freekiosk — otherwise a
++ *                                                      harmless local-only no-op.
++ *   event "managedConfigChanged": object              fired on every restrictions change
++ *
++ * See CLAUDE.md / the managed-config plan for the four schema conventions this
++ * relies on (large-numbers-as-strings, the ["__CLEAR__"] empty-list sentinel,
++ * the ungated top-level kiosk_pin entry, and Parcelable[] round-trip fidelity).
++ */
++class ManagedConfigModule(reactContext: ReactApplicationContext) :
++    ReactContextBaseJavaModule(reactContext) {
++
++    companion object {
++        private const val TAG = "ManagedConfig"
++        private const val EVENT_NAME = "managedConfigChanged"
++
++        // Mirror the vendored lib's own reconnect cadence (Const is package-private
++        // in com.hmdm so its constants aren't visible here — keep these in sync).
++        private const val CONNECT_RETRY_DELAY_FIRST_MS = 5000L
++        private const val CONNECT_RETRY_DELAY_NEXT_MS = 60000L
++    }
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++
++    // HeadwindMDM connection state. `mdmConnected` flips true only after the lib
++    // reports a successful bind to the launcher's PluginApiService.
++    @Volatile private var mdmConnected = false
++    private var connectStarted = false
++
++    // reportCustom() calls issued before the bind completes are coalesced here
++    // (latest value per slot wins) and flushed once connected — the launcher
++    // only keeps the last value per custom slot anyway, so coalescing is lossless.
++    private val pendingCustom = HashMap<Int, String>()
++
++    private val restrictionsReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context?, intent: Intent?) {
++            emitConfig()
++        }
++    }
++    private var receiverRegistered = false
++
++    private val mdmEventHandler = object : HeadwindMDM.EventHandler {
++        override fun onHeadwindMDMConnected() {
++            mdmConnected = true
++            Log.i(TAG, "HeadwindMDM connected; flushing ${pendingCustom.size} pending custom field(s)")
++            flushPendingCustom()
++        }
++
++        override fun onHeadwindMDMDisconnected() {
++            mdmConnected = false
++        }
++
++        override fun onHeadwindMDMConfigChanged() {
++            // The launcher signals a config update; re-read restrictions and notify JS.
++            // (Redundant with ACTION_APPLICATION_RESTRICTIONS_CHANGED, but this fires
++            // reliably even on transports where the system broadcast is delayed.)
++            emitConfig()
++        }
++    }
++
++    override fun getName(): String = "ManagedConfig"
++
++    override fun initialize() {
++        super.initialize()
++        registerReceiver()
++        startMdmConnect()
++    }
++
++    override fun invalidate() {
++        if (receiverRegistered) {
++            try {
++                reactApplicationContext.unregisterReceiver(restrictionsReceiver)
++            } catch (ignored: IllegalArgumentException) {
++            }
++            receiverRegistered = false
++        }
++        mainHandler.removeCallbacksAndMessages(null)
++        super.invalidate()
++    }
++
++    private fun registerReceiver() {
++        if (receiverRegistered) return
++        // ACTION_APPLICATION_RESTRICTIONS_CHANGED is delivered ONLY to runtime-
++        // registered receivers, never manifest-declared ones. FreeKiosk is a
++        // permanent foreground lock-task app, so registering here is sufficient.
++        val filter = IntentFilter(Intent.ACTION_APPLICATION_RESTRICTIONS_CHANGED)
++        reactApplicationContext.registerReceiver(restrictionsReceiver, filter)
++        receiverRegistered = true
++    }
++
++    /**
++     * Own retry-with-backoff loop around the FIRST connect(). The lib's internal
++     * MDMReconnectRunnable only kicks in after a previously-successful connection
++     * later drops — it does NOT retry an initial bind that failed because the
++     * launcher service wasn't up yet (the cold-boot race). So we drive the first
++     * successful bind ourselves.
++     */
++    private fun startMdmConnect() {
++        if (connectStarted) return
++        connectStarted = true
++        attemptConnect(CONNECT_RETRY_DELAY_FIRST_MS)
++    }
++
++    private fun attemptConnect(nextDelayMs: Long) {
++        if (mdmConnected) return
++        val available = try {
++            // connect() returns false if Headwind MDM isn't present/bindable yet.
++            HeadwindMDM.getInstance().connect(reactApplicationContext, mdmEventHandler)
++        } catch (e: Exception) {
++            Log.w(TAG, "HeadwindMDM.connect() threw: ${e.message}")
++            false
++        }
++        if (!available && !mdmConnected) {
++            mainHandler.postDelayed(
++                { attemptConnect(CONNECT_RETRY_DELAY_NEXT_MS) },
++                nextDelayMs,
++            )
++        }
++    }
++
++    private fun flushPendingCustom() {
++        if (!mdmConnected || pendingCustom.isEmpty()) return
++        val snapshot = HashMap(pendingCustom)
++        for ((slot, value) in snapshot) {
++            if (HeadwindMDM.getInstance().setCustom(slot, value)) {
++                pendingCustom.remove(slot)
++            }
++        }
++    }
++
++    @ReactMethod
++    fun getConfig(promise: Promise) {
++        try {
++            promise.resolve(readRestrictions())
++        } catch (e: Exception) {
++            promise.reject("MANAGED_CONFIG_ERROR", e)
++        }
++    }
++
++    /**
++     * Report a value to a Headwind device custom field (1..3) as an
++     * acknowledgement. If the lib isn't bound yet, the value is queued and
++     * flushed on connect rather than silently no-op'ing.
++     */
++    @ReactMethod
++    fun reportCustom(slot: Int, value: String, promise: Promise) {
++        try {
++            if (mdmConnected && HeadwindMDM.getInstance().setCustom(slot, value)) {
++                promise.resolve(true)
++            } else {
++                // Not connected (or setCustom returned false because the bind
++                // dropped) — queue it; flushPendingCustom() retries on connect.
++                pendingCustom[slot] = value
++                startMdmConnect()
++                promise.resolve(false)
++            }
++        } catch (e: Exception) {
++            promise.reject("MANAGED_CONFIG_REPORT_ERROR", e)
++        }
++    }
++
++    /**
++     * Forward a log line to the Headwind launcher's remote-log pipeline
++     * (MDMService.Log — also logs locally under logcat tag [TAG]). Fire and
++     * forget: no promise, since a logging call should never block or fail
++     * JS-side just because the MDM bind isn't up yet. Whether this actually
++     * reaches the webconsole's Device Log tab depends entirely on a
++     * server-side log rule matching com.freekiosk (LogConfigTable.match on
++     * the launcher side) — without one it's a no-op beyond the local log.
++     */
++    @ReactMethod
++    fun logRemote(level: String, message: String) {
++        try {
++            when (level.uppercase()) {
++                "ERROR" -> MDMService.Log.e(TAG, message)
++                "WARNING", "WARN" -> MDMService.Log.w(TAG, message)
++                "INFO" -> MDMService.Log.i(TAG, message)
++                "DEBUG" -> MDMService.Log.d(TAG, message)
++                "VERBOSE" -> MDMService.Log.v(TAG, message)
++                else -> MDMService.Log.i(TAG, message)
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "logRemote failed: ${e.message}")
++        }
++    }
++
++    // Required no-op stubs so NativeEventEmitter doesn't warn on RN >= 0.65.
++    @ReactMethod
++    fun addListener(eventName: String) {
++    }
++
++    @ReactMethod
++    fun removeListeners(count: Int) {
++    }
++
++    private fun emitConfig() {
++        val ctx = reactApplicationContext
++        if (!ctx.hasActiveReactInstance()) return
++        ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
++            .emit(EVENT_NAME, readRestrictions())
++    }
++
++    private fun readRestrictions(): WritableMap {
++        val um = reactApplicationContext.getSystemService(Context.USER_SERVICE) as? UserManager
++        val restrictions = um?.getApplicationRestrictions(reactApplicationContext.packageName)
++        return bundleToMap(restrictions ?: Bundle())
++    }
++
++    /**
++     * Bundle → WritableMap, handling every value type parseManagedConfig() on the
++     * launcher side can produce. The Parcelable[] branch (object arrays: managed
++     * apps, dashboard tiles, planner events, schedule rules, blocking regions,
++     * media playlist) is the non-obvious one and the single largest correctness
++     * surface — ported from the abandoned managed-config-sync branch's Java module.
++     */
++    private fun bundleToMap(bundle: Bundle): WritableMap {
++        val map = Arguments.createMap()
++        for (key in bundle.keySet()) {
++            when (val value = bundle.get(key)) {
++                null -> map.putNull(key)
++                is Boolean -> map.putBoolean(key, value)
++                is Int -> map.putInt(key, value)
++                is Long -> map.putDouble(key, value.toDouble())
++                is Float -> map.putDouble(key, value.toDouble())
++                is Double -> map.putDouble(key, value)
++                is String -> map.putString(key, value)
++                is Bundle -> map.putMap(key, bundleToMap(value))
++                is Array<*> -> map.putArray(key, arrayToWritable(value))
++                is IntArray -> {
++                    val arr = Arguments.createArray()
++                    for (n in value) arr.pushInt(n)
++                    map.putArray(key, arr)
++                }
++                is BooleanArray -> {
++                    val arr = Arguments.createArray()
++                    for (b in value) arr.pushBoolean(b)
++                    map.putArray(key, arr)
++                }
++                else -> map.putString(key, value.toString())
++            }
++        }
++        return map
++    }
++
++    private fun arrayToWritable(array: Array<*>): WritableArray {
++        val arr = Arguments.createArray()
++        for (element in array) {
++            when (element) {
++                null -> arr.pushNull()
++                is Bundle -> arr.pushMap(bundleToMap(element))
++                is Parcelable -> {
++                    // parseManagedConfig() emits nested objects as Bundle Parcelables;
++                    // anything non-Bundle we can't meaningfully represent, so skip it
++                    // rather than crash.
++                    if (element is Bundle) arr.pushMap(bundleToMap(element))
++                }
++                is String -> arr.pushString(element)
++                is Boolean -> arr.pushBoolean(element)
++                is Int -> arr.pushInt(element)
++                is Long -> arr.pushDouble(element.toDouble())
++                is Float -> arr.pushDouble(element.toDouble())
++                is Double -> arr.pushDouble(element)
++                else -> arr.pushString(element.toString())
++            }
++        }
++        return arr
++    }
++}
+diff --git a/android/app/src/main/java/com/freekiosk/ManagedConfigPackage.kt b/android/app/src/main/java/com/freekiosk/ManagedConfigPackage.kt
+new file mode 100644
+index 0000000..03ab655
+--- /dev/null
++++ b/android/app/src/main/java/com/freekiosk/ManagedConfigPackage.kt
+@@ -0,0 +1,16 @@
++package com.freekiosk
++
++import com.facebook.react.ReactPackage
++import com.facebook.react.bridge.NativeModule
++import com.facebook.react.bridge.ReactApplicationContext
++import com.facebook.react.uimanager.ViewManager
++
++class ManagedConfigPackage : ReactPackage {
++    override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
++        return listOf(ManagedConfigModule(reactContext))
++    }
++
++    override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {
++        return emptyList()
++    }
++}
+diff --git a/android/app/src/main/java/com/hmdm/Const.java b/android/app/src/main/java/com/hmdm/Const.java
+new file mode 100644
+index 0000000..1961707
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/Const.java
+@@ -0,0 +1,37 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++class Const {
++    static final String SERVICE_ACTION = "com.hmdm.action.Connect";
++    static final String PACKAGE = "com.hmdm.launcher";
++    static final String LEGACY_PACKAGE = "ru.headwind.kiosk";
++    static final String ADMIN_RECEIVER_CLASS = "com.hmdm.launcher.AdminReceiver";
++
++    public static final String INTENT_PUSH_NOTIFICATION_PREFIX = "com.hmdm.push.";
++    public static final String INTENT_PUSH_NOTIFICATION_EXTRA = "com.hmdm.PUSH_DATA";
++
++    public static final String LOG_TAG ="HeadwindMDMAPI";
++
++    public static final String NOTIFICATION_CONFIG_UPDATED = "com.hmdm.push.configUpdated";
++
++    public static final int HMDM_RECONNECT_DELAY_FIRST = 5000;
++    public static final int HMDM_RECONNECT_DELAY_NEXT = 60000;
++}
+diff --git a/android/app/src/main/java/com/hmdm/HeadwindMDM.java b/android/app/src/main/java/com/hmdm/HeadwindMDM.java
+new file mode 100644
+index 0000000..501190a
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/HeadwindMDM.java
+@@ -0,0 +1,358 @@
++package com.hmdm;
++
++import android.annotation.SuppressLint;
++import android.content.BroadcastReceiver;
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.content.pm.PackageManager;
++import android.os.Build;
++import android.os.Bundle;
++import android.os.Handler;
++
++import java.net.MalformedURLException;
++import java.net.URL;
++
++import dalvik.system.PathClassLoader;
++
++/**
++ * Higher level Headwind MDM integration API incapsulating reconnection to the service and configuration update
++ */
++public class HeadwindMDM {
++
++    public interface EventHandler {
++        // This method is called when Headwind MDM is ready to answer
++        // Get your app settings in this method using MDMService.Preferences.get()
++        void onHeadwindMDMConnected();
++        // This is just an informative method which doesn't need any actions
++        // It should be followed by Connected() method shortly
++        void onHeadwindMDMDisconnected();
++        // Notification about the configuration change
++        // Refresh your app settings in this method using MDMService.Preferences.get()
++        void onHeadwindMDMConfigChanged();
++    }
++
++    private static HeadwindMDM instance;
++
++    public static HeadwindMDM getInstance() {
++        if (instance == null) {
++            instance = new HeadwindMDM();
++        }
++        return instance;
++    }
++
++    private MDMService mdmService;
++    private boolean mdmConnected = false;
++    private boolean mustRun = false;
++
++    private EventHandler eventHandler;
++    private Context context;
++
++    private String serverHost;
++    private String secondaryServerHost;
++    private String serverPath;
++    private String deviceId;
++    private String custom1;
++    private String custom2;
++    private String custom3;
++    private boolean isManaged;
++    private boolean isKiosk;
++    private String imei;
++    private String serial;
++    private int version;
++    private String apiKey;
++    private int mdmAgentError = 0;
++
++    private BroadcastReceiver configUpdateReceiver = new BroadcastReceiver() {
++        @Override
++        public void onReceive(Context context, Intent intent) {
++            if (intent.getAction().equals(Const.NOTIFICATION_CONFIG_UPDATED) && eventHandler != null) {
++                eventHandler.onHeadwindMDMConfigChanged();
++            }
++        }
++    };
++
++    public void setApiKey(String apiKey) {
++        this.apiKey = apiKey;
++    }
++
++    /**
++     * Connect to Headwind MDM service
++     * @param context
++     * @param eventHandler
++     * @return true if Headwind MDM exists, false otherwise
++     */
++    @SuppressLint("UnspecifiedRegisterReceiverFlag")
++    public boolean connect(final Context context, final EventHandler eventHandler) {
++        mdmService = MDMService.getInstance();
++        this.eventHandler = eventHandler;
++        this.context = context;
++        this.mdmAgentError = 0;
++
++        boolean wasConnected = mdmConnected;
++        if (!mdmService.connect(context, resultHandler)) {
++            mdmConnected = false;
++            return false;
++        }
++
++        if (!wasConnected) {
++            // We register the receiver only once
++            // so connect() method can be called multiple times
++
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                context.registerReceiver(configUpdateReceiver, new IntentFilter(Const.NOTIFICATION_CONFIG_UPDATED), Context.RECEIVER_EXPORTED);
++            } else {
++                context.registerReceiver(configUpdateReceiver, new IntentFilter(Const.NOTIFICATION_CONFIG_UPDATED));
++            }
++        }
++
++        mustRun = true;
++        return true;
++    }
++
++    public boolean isConnected() {
++        return mdmConnected;
++    }
++
++    public void disconnect(Context context) {
++        mustRun = false;
++        mdmConnected = false;
++        try {
++            context.unregisterReceiver(configUpdateReceiver);
++        } catch (Exception e) {
++            // Ignore exception if receiver was not registered
++        }
++    }
++
++    public String getServerHost() {
++        try {
++            URL url = new URL(serverHost);
++            return url.getHost();
++        } catch (MalformedURLException e) {
++            return null;
++        }
++    }
++
++    public String getSecondaryServerHost() {
++        try {
++            URL url = new URL(secondaryServerHost);
++            return url.getHost();
++        } catch (MalformedURLException e) {
++            return null;
++        }
++    }
++
++    public String getServerPath() {
++        return serverPath;
++    }
++
++    public String getDeviceId() {
++        return deviceId;
++    }
++
++    public String getServerUrl() {
++        if (serverPath != null && !serverPath.equals("")) {
++            return serverHost + "/" + serverPath;
++        } else {
++            return serverHost;
++        }
++    }
++
++    public String getSecondaryServerUrl() {
++        if (!serverPath.equals("")) {
++            return serverHost + "/" + serverPath;
++        } else {
++            return serverHost;
++        }
++    }
++
++    public String getCustom(int number) {
++        switch (number) {
++            case 1:
++                return custom1;
++            case 2:
++                return custom2;
++            case 3:
++                return custom3;
++            default:
++                return null;
++        }
++    }
++
++    public boolean isManaged() {
++        return isManaged;
++    }
++
++    public boolean isKiosk() {
++        return isKiosk;
++    }
++
++    public String getSerial() {
++        return serial;
++    }
++
++    public String getImei() {
++        return imei;
++    }
++
++    public int getVersion() {
++        return version;
++    }
++
++    public int getMdmAgentError() {
++        return mdmAgentError;
++    }
++
++    public void forceConfigUpdate() {
++        if (mdmConnected) {
++            mdmAgentError = 0;
++            try {
++                mdmService.forceConfigUpdate();
++            } catch (MDMException e) {
++                mdmAgentError = e.mdmError.code;
++                e.printStackTrace();
++            }
++        }
++    }
++
++    public boolean setCustom(int number, String value) {
++        if (!mdmConnected) {
++            return false;
++        }
++        try {
++            mdmAgentError = 0;
++            mdmService.setCustom(number, value);
++        } catch (MDMException e) {
++            mdmAgentError = e.mdmError.code;
++            e.printStackTrace();
++            return false;
++        }
++        return true;
++    }
++
++    public boolean sendPush(String type, String payload) {
++        if (!mdmConnected) {
++            return false;
++        }
++        try {
++            mdmAgentError = 0;
++            return mdmService.sendPush(apiKey, type, payload);
++        } catch (MDMException e) {
++            mdmAgentError = e.mdmError.code;
++            e.printStackTrace();
++            return false;
++        }
++    }
++
++    // Get the admin component for applications using "com.hmdm" shared user ID
++    // This component could be used to use DevicePolicyManager in those applications
++    public ComponentName getAdminComponent(Context context) {
++        // We must use the context of Device Owner
++        // Since we're using the same shared user, it should be returned without any security issues
++        Context deviceOwnerContext = null;
++        try {
++            deviceOwnerContext = context.createPackageContext(Const.PACKAGE, 0);
++        } catch (Exception e) {
++            e.printStackTrace();
++            return null;
++        }
++
++        // Android SDK is not supposed to load classes of another application
++        // However since we're using the same shared user ID (so it's the same application underhood),
++        // we can use a hack to get the required class
++        String apkName = null;
++        try {
++            apkName = context.getPackageManager().getApplicationInfo(Const.PACKAGE, 0).sourceDir;
++        } catch (PackageManager.NameNotFoundException e) {
++            e.printStackTrace();
++            return null;
++        }
++
++        PathClassLoader pathClassLoader = new dalvik.system.PathClassLoader(
++                apkName,
++                ClassLoader.getSystemClassLoader());
++
++        Class adminReceiverClass = null;
++        try {
++            adminReceiverClass = Class.forName(Const.ADMIN_RECEIVER_CLASS, true, pathClassLoader);
++        } catch (ClassNotFoundException e) {
++            e.printStackTrace();
++            return null;
++        }
++
++        return new ComponentName(deviceOwnerContext, adminReceiverClass);
++    }
++
++    /* Automatic reconnection mechanism */
++
++    public MDMService.ResultHandler resultHandler = new MDMService.ResultHandler() {
++        @Override
++        public void onMDMConnected() {
++            mdmConnected = true;
++            mdmAgentError = 0;
++
++            Bundle data = null;
++            try {
++                version = mdmService.getVersion();
++                if (version > MDMService.INITIAL_VERSION && apiKey != null) {
++                    data = mdmService.queryConfig(apiKey);
++                } else {
++                    data = mdmService.queryConfig();
++                }
++
++                if (data == null) {
++                    throw new MDMException(MDMError.ERROR_NOT_CONFIGURED);
++                }
++
++                // NPE can be here! queryConfig() may return null if Headwind MDM
++                // is not configured. Not sure how to handle this, though
++                serverHost = data.getString(MDMService.KEY_SERVER_HOST);
++                secondaryServerHost = data.getString(MDMService.KEY_SECONDARY_SERVER_HOST);
++                serverPath = data.getString(MDMService.KEY_SERVER_PATH);
++                deviceId = data.getString(MDMService.KEY_DEVICE_ID);
++                custom1 = data.getString(MDMService.KEY_CUSTOM_1);
++                custom2 = data.getString(MDMService.KEY_CUSTOM_2);
++                custom3 = data.getString(MDMService.KEY_CUSTOM_3);
++                // null / false values for older launcher API versions or wrong API key
++                isManaged = data.getBoolean(MDMService.KEY_IS_MANAGED);
++                isKiosk = data.getBoolean(MDMService.KEY_IS_KIOSK);
++                imei = data.getString(MDMService.KEY_IMEI);
++                serial = data.getString(MDMService.KEY_SERIAL);
++            } catch (MDMException e) {
++                mdmAgentError = e.mdmError.code;
++                e.printStackTrace();
++            }
++
++            if (eventHandler != null) {
++                eventHandler.onHeadwindMDMConnected();
++            }
++        }
++
++        @Override
++        public void onMDMDisconnected() {
++            // This may be raised when Headwind MDM launcher is updated or due to a launcher crash
++            mdmConnected = false;
++            if (mustRun) {
++                if (eventHandler != null) {
++                    eventHandler.onHeadwindMDMDisconnected();
++                }
++                new Handler().postDelayed(new MDMReconnectRunnable(), Const.HMDM_RECONNECT_DELAY_FIRST);
++            }
++        }
++    };
++
++    public class MDMReconnectRunnable implements Runnable {
++        @Override
++        public void run() {
++            if (!mustRun) {
++                return;
++            }
++            if (!mdmService.connect(context, resultHandler)) {
++                // Retry in 1 minute
++                new Handler().postDelayed(this, Const.HMDM_RECONNECT_DELAY_NEXT);
++            }
++        }
++    }
++
++}
+diff --git a/android/app/src/main/java/com/hmdm/MDMError.java b/android/app/src/main/java/com/hmdm/MDMError.java
+new file mode 100644
+index 0000000..c5035a7
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/MDMError.java
+@@ -0,0 +1,69 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++public class MDMError {
++    public int code;
++    public MDMError() {
++        code = 0;
++    }
++    public MDMError(int code) {
++        this.code = code;
++    }
++
++    public static String getMessage(int code) {
++        switch (code) {
++            case NO_ERROR:
++                return "";
++            case ERROR_NO_MDM:
++                return "Headwind MDM not installed";
++            case ERROR_INTERNAL:
++                return "Internal Headwind MDM error";
++            case ERROR_GENERAL:
++                return "General error";
++            case ERROR_DISCONNECTED:
++                return "MDM service not connected";
++            case ERROR_INVALID_PARAMETER:
++                return "Invalid parameter";
++            case ERROR_VERSION:
++                return "Please update Headwind MDM launcher";
++            case ERROR_KEY_NOT_MATCH:
++                return "API key is not correct";
++            case ERROR_NOT_CONFIGURED:
++                return "Mobile agent is not configured";
++            default:
++                return "Unknown error";
++        }
++    }
++
++    public String getMessage() {
++        return getMessage(code);
++    }
++
++    public static final int NO_ERROR = 0;
++    public static final int ERROR_NO_MDM = 1;           // Headwind MDM not installed
++    public static final int ERROR_INTERNAL = 2;         // Launcher internal error
++    public static final int ERROR_GENERAL = 3;          // Library error
++    public static final int ERROR_DISCONNECTED = 4;     // Service disconnected
++    public static final int ERROR_INVALID_PARAMETER = 5;
++    public static final int ERROR_VERSION = 6;          // Launcher needs to update
++    public static final int ERROR_KEY_NOT_MATCH = 7;    // API key does not match
++    public static final int ERROR_NOT_CONFIGURED = 8;  // Headwind MDM is not configured
++}
+diff --git a/android/app/src/main/java/com/hmdm/MDMException.java b/android/app/src/main/java/com/hmdm/MDMException.java
+new file mode 100644
+index 0000000..940a943
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/MDMException.java
+@@ -0,0 +1,34 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++public class MDMException extends Exception {
++    public MDMError mdmError;
++    public String comment;
++    public MDMException(int code) {
++        super(MDMError.getMessage(code));
++        mdmError = new MDMError(code);
++    }
++    public MDMException(int code, String comment) {
++        super(MDMError.getMessage(code) + ": " + comment);
++        mdmError = new MDMError(code);
++        this.comment = comment;
++    }
++}
+diff --git a/android/app/src/main/java/com/hmdm/MDMPushHandler.java b/android/app/src/main/java/com/hmdm/MDMPushHandler.java
+new file mode 100644
+index 0000000..555d9b3
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/MDMPushHandler.java
+@@ -0,0 +1,71 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.os.Build;
++
++public abstract class MDMPushHandler {
++    private BroadcastReceiver receiver;
++
++    // This should be overridden
++    public abstract void onMessageReceived(MDMPushMessage message);
++
++    public void register(String messageType, Context context) {
++        register(new String[] { messageType }, context);
++    }
++
++    public void register(String[] messageTypes, Context context) {
++        if (messageTypes.length == 0) {
++            return;
++        }
++
++        IntentFilter intentFilter = new IntentFilter();
++        for (int n = 0; n < messageTypes.length; n++) {
++            intentFilter.addAction(Const.INTENT_PUSH_NOTIFICATION_PREFIX + messageTypes[n]);
++        }
++        receiver = new BroadcastReceiver() {
++            @Override
++            public void onReceive(Context context, Intent intent) {
++                try {
++                    MDMPushMessage message = new MDMPushMessage(intent.getAction(), intent.getExtras());
++                    onMessageReceived(message);
++                } catch (MDMException e) {
++                    e.printStackTrace();
++                }
++            }
++        };
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            context.registerReceiver(receiver, intentFilter, Context.RECEIVER_EXPORTED);
++        } else {
++            context.registerReceiver(receiver, intentFilter);
++        }
++    }
++
++    public void unregister(Context context) {
++        if (receiver != null) {
++            context.unregisterReceiver(receiver);
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/hmdm/MDMPushMessage.java b/android/app/src/main/java/com/hmdm/MDMPushMessage.java
+new file mode 100644
+index 0000000..d67e6fb
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/MDMPushMessage.java
+@@ -0,0 +1,65 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++import android.os.Bundle;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++public class MDMPushMessage {
++    private String type;
++    private JSONObject data;
++
++    public static final String MessageConfigUpdated = "configUpdated";
++
++    public MDMPushMessage(String action, Bundle bundle) throws MDMException {
++        if (!action.startsWith(Const.INTENT_PUSH_NOTIFICATION_PREFIX)) {
++            throw new MDMException(MDMError.ERROR_INVALID_PARAMETER);
++        }
++        type = action.substring(Const.INTENT_PUSH_NOTIFICATION_PREFIX.length());
++        if (bundle != null) {
++            String packedPayload = bundle.getString(Const.INTENT_PUSH_NOTIFICATION_EXTRA);
++            if (packedPayload != null) {
++                try {
++                    data = new JSONObject(packedPayload);
++                } catch (JSONException e) {
++                    throw new MDMException(MDMError.ERROR_INVALID_PARAMETER);
++                }
++            }
++        }
++    }
++
++    public String getType() {
++        return type;
++    }
++
++    public void setType(String type) {
++        this.type = type;
++    }
++
++    public JSONObject getData() {
++        return data;
++    }
++
++    public void setData(JSONObject data) {
++        this.data = data;
++    }
++}
+diff --git a/android/app/src/main/java/com/hmdm/MDMService.java b/android/app/src/main/java/com/hmdm/MDMService.java
+new file mode 100644
+index 0000000..ff12a7c
+--- /dev/null
++++ b/android/app/src/main/java/com/hmdm/MDMService.java
+@@ -0,0 +1,331 @@
++/*
++ * Headwind MDM: Open Source Android MDM Software
++ * https://h-mdm.com
++ *
++ * Copyright (C) 2019 Headwind Solutions LLC (http://h-sms.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.hmdm;
++
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.content.ServiceConnection;
++import android.os.Bundle;
++import android.os.IBinder;
++import android.os.RemoteException;
++
++public class MDMService {
++    // MDM configuration attributes
++    public static final String KEY_SERVER_HOST = "SERVER_HOST";
++    public static final String KEY_SECONDARY_SERVER_HOST = "SECONDARY_SERVER_HOST";
++    public static final String KEY_SERVER_PATH = "SERVER_PATH";
++    public static final String KEY_DEVICE_ID = "DEVICE_ID";
++    public static final String KEY_CUSTOM_1 = "CUSTOM_1";
++    public static final String KEY_CUSTOM_2 = "CUSTOM_2";
++    public static final String KEY_CUSTOM_3 = "CUSTOM_3";
++    public static final String KEY_IMEI = "IMEI";
++    public static final String KEY_SERIAL = "SERIAL";
++    public static final String KEY_IS_MANAGED = "IS_MANAGED";
++    public static final String KEY_IS_KIOSK = "IS_KIOSK";
++    public static final String KEY_ERROR = "ERROR";
++
++    public static final int INITIAL_VERSION = 112;
++
++    private Context context;
++    private IMdmApi mdmApi;
++    private RemoteServiceConnection serviceConnection;
++
++    private static MDMService instance;
++
++    public interface ResultHandler {
++        void onMDMConnected();
++        void onMDMDisconnected();
++    }
++
++    public static MDMService getInstance() {
++        if (instance == null) {
++            instance = new MDMService();
++        }
++        return instance;
++    }
++
++    /**
++     * Connect to the MDM service
++     * @param handler
++     * @return true on success and false if no Headwind MDM installed
++     */
++    public boolean connect(Context context, ResultHandler handler) {
++        this.context = context;
++        serviceConnection = new RemoteServiceConnection(handler);
++
++        // First we try up-to-date package
++        Intent i = new Intent(Const.SERVICE_ACTION);
++        i.setPackage(Const.PACKAGE);
++        boolean ret = context.bindService(i, serviceConnection, Context.BIND_AUTO_CREATE);
++        if (!ret) {
++            android.util.Log.i("MDMService", "Failed to bind service: intent " + i.getAction() + ", package " + i.getPackage());
++            // Try legacy package
++            i.setPackage(Const.LEGACY_PACKAGE);
++            ret = context.bindService(i, serviceConnection, Context.BIND_AUTO_CREATE);
++        }
++        if (!ret) {
++            android.util.Log.i("MDMService", "Failed to bind legacy service: intent " + i.getAction() + ", package " + i.getPackage());
++        }
++
++        return ret;
++    }
++
++    class RemoteServiceConnection implements ServiceConnection {
++
++        ResultHandler handler;
++
++        public RemoteServiceConnection(ResultHandler handler) {
++            super();
++            this.handler = handler;
++        }
++
++        public void onServiceConnected(ComponentName name, IBinder boundService) {
++            mdmApi = IMdmApi.Stub.asInterface((IBinder) boundService);
++            if (handler != null) {
++                handler.onMDMConnected();
++            }
++        }
++
++        public void onServiceDisconnected(ComponentName name) {
++            mdmApi = null;
++            if (handler != null) {
++                handler.onMDMDisconnected();
++            }
++        }
++    }
++
++    /**
++     * Get version
++     */
++    public int getVersion() throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        try {
++            return mdmApi.getVersion();
++        } catch (RemoteException e) {
++            // No getVersion() method prior to 1.1.3, so return 0 by default
++            return 0;
++        }
++    }
++
++    /**
++     * Request the configuration update by the app
++     * This method forces the application update even if the background update is scheduled
++     * Reason: this method may be called manually from a kiosk app
++     */
++    public void forceConfigUpdate() throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        try {
++            mdmApi.forceConfigUpdate();
++        } catch (RemoteException e) {
++            // No forceConfigUpdate() method prior to 1.1.5
++        }
++    }
++
++    /**
++     * Query configuration
++     */
++    public Bundle queryConfig() throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        try {
++            return mdmApi.queryConfig();
++        } catch (RemoteException e) {
++            throw new MDMException(MDMError.ERROR_INTERNAL);
++        }
++    }
++
++    /**
++     * Query configuration (including privileged fields)
++     */
++    public Bundle queryConfig(String apiKey) throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        if (getVersion() <= INITIAL_VERSION) {
++            throw new MDMException(MDMError.ERROR_VERSION);
++        }
++
++        try {
++            Bundle config = mdmApi.queryPrivilegedConfig(apiKey);
++            String error = config.getString(KEY_ERROR);
++            if (error != null) {
++                if (error.equals("KEY_NOT_MATCH")) {
++                    throw new MDMException(MDMError.ERROR_KEY_NOT_MATCH);
++                } else {
++                    throw new MDMException(MDMError.ERROR_INTERNAL);
++                }
++            }
++            return config;
++        } catch (RemoteException e) {
++            throw new MDMException(MDMError.ERROR_INTERNAL);
++        }
++    }
++
++    /**
++     * Set a custom field to send its value to the server
++     */
++    public void setCustom(int number, String value) throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        if (getVersion() <= INITIAL_VERSION) {
++            throw new MDMException(MDMError.ERROR_VERSION);
++        }
++
++        try {
++            mdmApi.setCustom(number, value);
++        } catch (RemoteException e) {
++            throw new MDMException(MDMError.ERROR_INTERNAL);
++        }
++    }
++
++    /**
++     * Send a push command
++     */
++    public boolean sendPush(String apiKey, String type, String payload) throws MDMException {
++        if (mdmApi == null) {
++            throw new MDMException(MDMError.ERROR_DISCONNECTED);
++        }
++
++        if (getVersion() < 118) {
++            throw new MDMException(MDMError.ERROR_VERSION);
++        }
++
++        try {
++            return mdmApi.sendPush(apiKey, type, payload);
++        } catch (RemoteException e) {
++            throw new MDMException(MDMError.ERROR_INTERNAL);
++        }
++    }
++
++    /**
++     * Usage:
++     * Log.v (etc)
++     */
++    public static class Log {
++        public static final int ERROR = 1;
++        public static final int WARN = 2;
++        public static final int INFO = 3;
++        public static final int DEBUG = 4;
++        public static final int VERBOSE = 5;
++
++        public static void log(int level, String tag, String message) {
++            if (instance == null || instance.mdmApi == null || instance.context == null) {
++                // Not initialized, just return
++                android.util.Log.w(Const.LOG_TAG, "Remote logger not initialized!");
++                return;
++            }
++            try {
++                String finalMessage = tag != null ? tag + " " + message : message;
++                instance.mdmApi.log(System.currentTimeMillis(), level, instance.context.getPackageName(), finalMessage);
++            } catch (Exception e) {
++                android.util.Log.w(Const.LOG_TAG, "Remote exception while trying to send a log to Headwind MDM!");
++                e.printStackTrace();
++            }
++        }
++
++        public static void v(String tag, String message) {
++            android.util.Log.v(tag, message);
++            log(VERBOSE, tag, message);
++        }
++
++        public static void d(String tag, String message) {
++            android.util.Log.d(tag, message);
++            log(DEBUG, tag, message);
++        }
++
++        public static void i(String tag, String message) {
++            android.util.Log.i(tag, message);
++            log(INFO, tag, message);
++        }
++
++        public static void w(String tag, String message) {
++            android.util.Log.w(tag, message);
++            log(WARN, tag, message);
++        }
++
++        public static void e(String tag, String message) {
++            android.util.Log.e(tag, message);
++            log(ERROR, tag, message);
++        }
++    }
++
++    public static class Preferences {
++
++        public static String get(String attr, String defValue) {
++            if (instance == null || instance.mdmApi == null || instance.context == null) {
++                // Not initialized, just return
++                android.util.Log.w(Const.LOG_TAG, "Connection to Headwind MDM not initialized!");
++                return defValue;
++            }
++            try {
++                String result = instance.mdmApi.queryAppPreference(instance.context.getPackageName(), attr);
++                if (result == null) {
++                    return defValue;
++                }
++                return result;
++            } catch (Exception e) {
++                android.util.Log.w(Const.LOG_TAG, "Remote exception while trying to get Headwind MDM app preference " + attr);
++                e.printStackTrace();
++            }
++            return defValue;
++        }
++
++        public static boolean set(String attr, String value) {
++            if (instance == null || instance.mdmApi == null || instance.context == null) {
++                // Not initialized, just return
++                android.util.Log.w(Const.LOG_TAG, "Connection to Headwind MDM not initialized!");
++            }
++            try {
++                return instance.mdmApi.setAppPreference(instance.context.getPackageName(), attr, value);
++            } catch (Exception e) {
++                android.util.Log.w(Const.LOG_TAG, "Remote exception while trying to set Headwind MDM app preference " + attr + "=" + value);
++                e.printStackTrace();
++            }
++            return false;
++        }
++
++        public static void apply() {
++            if (instance == null || instance.mdmApi == null || instance.context == null) {
++                // Not initialized, just return
++                android.util.Log.w(Const.LOG_TAG, "Connection to Headwind MDM not initialized!");
++                return;
++            }
++            try {
++                instance.mdmApi.commitAppPreferences(instance.context.getPackageName());
++            } catch (Exception e) {
++                android.util.Log.w(Const.LOG_TAG, "Remote exception while trying to apply Headwind MDM app preferences!");
++                e.printStackTrace();
++            }
++        }
++    }
++
++}
+diff --git a/src/hooks/useManagedConfigSync.ts b/src/hooks/useManagedConfigSync.ts
+new file mode 100644
+index 0000000..cf3fe29
+--- /dev/null
++++ b/src/hooks/useManagedConfigSync.ts
+@@ -0,0 +1,70 @@
++import { useEffect } from 'react';
++import { NativeModules, NativeEventEmitter } from 'react-native';
++import { applyManagedConfig, ApplyResult, ManagedConfigNative } from '../utils/applyManagedConfig';
++import { kioskScreenActionsRef } from '../utils/kioskScreenActions';
++
++const { ManagedConfig } = NativeModules as {
++  ManagedConfig?: ManagedConfigNative & {
++    getConfig(): Promise<Record<string, unknown>>;
++  };
++};
++
++/**
++ * App-root effect: applies Headwind MDM managed configuration (App
++ * Restrictions) whenever it changes, and refreshes the currently-mounted
++ * Kiosk screen live so a mid-session change is visible without a manual
++ * background/foreground or a reboot — no different from how PIN changes
++ * already take effect.
++ *
++ * Reload trigger: calls kioskScreenActionsRef.current?.reloadSettings()
++ * directly (see src/utils/kioskScreenActions.ts) whenever the bulk config
++ * actually wrote at least one field — never for a PIN-only change (the PIN is
++ * read fresh at PIN-entry time; nothing on screen is stale), and never for a
++ * push where every field already matched the device (nothing to refresh).
++ * This is not a navigation action, so it never interrupts a supervisor
++ * mid-edit in Settings/PinScreen — it just quietly updates KioskScreen's
++ * state, which is visible instantly if Kiosk is in the foreground and
++ * otherwise already correct the next time the user navigates back to it.
++ */
++export function useManagedConfigSync(): void {
++  useEffect(() => {
++    if (!ManagedConfig) {
++      // Native module not present (e.g. non-managed build/device) — no-op.
++      return;
++    }
++
++    let mounted = true;
++    const emitter = new NativeEventEmitter(ManagedConfig as any);
++
++    const handleReload = (result: ApplyResult) => {
++      if (!result.bulkApplied) return;
++      kioskScreenActionsRef.current?.reloadSettings();
++    };
++
++    const apply = async (restrictions: Record<string, unknown>) => {
++      try {
++        const result = await applyManagedConfig(restrictions, ManagedConfig);
++        if (mounted) handleReload(result);
++      } catch (e) {
++        console.warn('[ManagedConfig] apply failed:', e);
++      }
++    };
++
++    ManagedConfig.getConfig()
++      .then((cfg) => {
++        if (mounted) apply(cfg);
++      })
++      .catch(() => {
++        /* no config yet — ignore */
++      });
++
++    const sub = emitter.addListener('managedConfigChanged', (cfg) => {
++      if (mounted) apply(cfg as Record<string, unknown>);
++    });
++
++    return () => {
++      mounted = false;
++      sub.remove();
++    };
++  }, []);
++}
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index d00f06d..d8c4da5 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -29,6 +29,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+ import type { RootStackParamList } from '../navigation/AppNavigator';
+ import Icon from '../components/Icon';
+ import { revokeSettingsAccess } from '../utils/authState';
++import { kioskScreenActionsRef } from '../utils/kioskScreenActions';
+ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
+ 
+ const { HttpServerModule } = NativeModules;
+@@ -1876,6 +1877,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+     }
+   };
+ 
++  // Register a live-reload hook so managed-config pushes can refresh this
++  // screen's settings immediately (no navigation, no remount, no reboot) —
++  // see src/utils/kioskScreenActions.ts for why this is always safe to call.
++  useEffect(() => {
++    kioskScreenActionsRef.current = { reloadSettings: () => { loadSettings(); } };
++    return () => {
++      kioskScreenActionsRef.current = null;
++    };
++  });
++
+   const resetTimer = () => {
+     clearTimer();
+     // Don't start inactivity timer if screen is in scheduled sleep
+diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
+new file mode 100644
+index 0000000..270314c
+--- /dev/null
++++ b/src/utils/applyManagedConfig.ts
+@@ -0,0 +1,636 @@
++/**
++ * applyManagedConfig — applies a Headwind MDM managed-configuration payload
++ * (Android App Restrictions) onto FreeKiosk's local settings.
++ *
++ * Delivery: the Headwind launcher (device owner) pushes an "Application setting"
++ * for com.freekiosk. The `managedConfig` attribute carries a JSON blob of all
++ * fleet-wide settings plus a `config_version`; `kiosk_pin` / `kiosk_pin_label`
++ * arrive as top-level sibling attributes (per-device PIN rotation). The native
++ * ManagedConfigModule reads the whole restrictions bundle and hands it here.
++ *
++ * Conventions this file depends on (see the managed-config plan):
++ *   1. Any number that can exceed 32-bit int range — AND ANY DECIMAL — must be
++ *      sent as a JSON *string*. The launcher's parseManagedConfig has TWO cast
++ *      bugs: Long→(int) and Double→(float), both throwing ClassCastException
++ *      mid-parse; every key AFTER the offending one is silently dropped
++ *      (earlier keys survive, which is why config_version — always first —
++ *      keeps arriving while later fields vanish). Number fields here coerce
++ *      with Number(), which accepts numeric strings, so quoting is lossless.
++ *   2. A list cannot be emptied with a bare [] (the launcher skips zero-length
++ *      arrays). The sentinel ["__CLEAR__"] means "set this list to empty".
++ *   3. kiosk_pin is a top-level, ungated, normalized, separately-acked entry —
++ *      applied on every emission regardless of config_version (per-device PIN
++ *      pushes don't bump the fleet version). See applyPin().
++ *   4. Object-array fields arrive as arrays of plain objects (native converts
++ *      the launcher's Parcelable[] of Bundles); they are passed straight to the
++ *      setters, which persist them as JSON.
++ *   5. The launcher FLATTENS the managedConfig attribute's JSON keys directly
++ *      into the top level of the restrictions bundle — there is no nested
++ *      `managedConfig` object on the device (see AppRestrictionUpdater on the
++ *      launcher side). `config_version` and every field key are read from the
++ *      top level of `restrictions`.
++ *   6. Every field is compared against its CURRENT on-device value (via the
++ *      matching StorageService getter) before writing. A value identical to
++ *      what's already stored is left alone ("skipped"), not rewritten — a
++ *      push is a list of desired values, not a list of commands, so one
++ *      field matching what's already there never blocks any other field in
++ *      the same push. See applyBulk()/applyFieldGroup().
++ *   7. Version gating with content fingerprint: same version + same payload =
++ *      routine re-delivery (silent skip; the launcher re-sends on every sync
++ *      and app restart). Same version + CHANGED payload = operator forgot to
++ *      bump config_version → ERROR, nothing applied. Numerically LOWER
++ *      version than last applied = regression → ERROR, nothing applied.
++ *   8. Push-shape validation: unknown keys (typos/case mistakes) are reported
++ *      as errors; the optional `config_fields` key (comma-separated string of
++ *      expected field names) lets the device detect fields that were dropped
++ *      upstream by the launcher parser bugs and report them as errors too.
++ *      Both are non-blocking — valid fields in the same push still apply.
++ */
++
++import { StorageService } from './storage';
++import { saveSecurePin, securePinMatches } from './secureStorage';
++
++// Must match the fleet's actual configured PIN length so an admin who forgets
++// to quote the value in the console (pushing it as an integer) still gets the
++// correct zero-padded string on-device. Correct quoting remains the primary
++// rule; this padding is only a safety net.
++export const KIOSK_PIN_LENGTH = 6;
++
++const CLEAR_SENTINEL = '__CLEAR__';
++
++// Native module surface used for the acknowledgement side-channel and
++// optional remote-log forwarding (see logRemote below).
++export interface ManagedConfigNative {
++  reportCustom(slot: number, value: string): Promise<boolean>;
++  /**
++   * Fire-and-forget: forwards a log line to the Headwind launcher's remote-log
++   * pipeline (MDMService.Log on the native side), which ALSO logs locally.
++   * Whether it reaches the webconsole's Device Log tab depends on a
++   * server-side log rule matching com.freekiosk; without one this is a
++   * harmless no-op beyond the native-side local log.
++   */
++  logRemote?(level: 'INFO' | 'WARNING' | 'ERROR', message: string): void;
++}
++
++// ---- coercion helpers ------------------------------------------------------
++
++function toBool(v: unknown): boolean {
++  if (typeof v === 'boolean') return v;
++  if (typeof v === 'number') return v !== 0;
++  if (typeof v === 'string') return v === 'true' || v === '1';
++  return false;
++}
++
++function toNum(v: unknown): number | undefined {
++  // Convention 1: numeric strings are first-class here.
++  const n = typeof v === 'number' ? v : Number(v);
++  return Number.isFinite(n) ? n : undefined;
++}
++
++function toStr(v: unknown): string {
++  return v == null ? '' : String(v);
++}
++
++/** Convention 2: resolve the ["__CLEAR__"] sentinel to a real empty array. */
++function resolveList<T>(v: unknown): T[] | undefined {
++  if (!Array.isArray(v)) return undefined;
++  if (v.length === 1 && v[0] === CLEAR_SENTINEL) return [];
++  return v as T[];
++}
++
++/** Render a field value for a log line — compact, human-readable. */
++function formatValue(v: unknown): string {
++  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
++  try {
++    return JSON.stringify(v);
++  } catch {
++    return String(v);
++  }
++}
++
++/**
++ * Log a business-outcome message both locally (console) and — if the native
++ * module supports it — via logRemote(), so it can be forwarded to the
++ * Headwind launcher's remote-log pipeline and, if a server-side log rule
++ * matches, show up in the webconsole's Device Log tab.
++ */
++function logInfo(native: ManagedConfigNative | undefined, message: string) {
++  console.log(`[ManagedConfig] INFO: ${message}`);
++  try {
++    native?.logRemote?.('INFO', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(INFO) failed:', e);
++  }
++}
++
++function logWarn(native: ManagedConfigNative | undefined, message: string) {
++  console.warn(`[ManagedConfig] WARNING: ${message}`);
++  try {
++    native?.logRemote?.('WARNING', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(WARNING) failed:', e);
++  }
++}
++
++function logError(native: ManagedConfigNative | undefined, message: string) {
++  console.error(`[ManagedConfig] ERROR: ${message}`);
++  try {
++    native?.logRemote?.('ERROR', message);
++  } catch (e) {
++    console.warn('[ManagedConfig] logRemote(ERROR) failed:', e);
++  }
++}
++
++// ---- apply table -----------------------------------------------------------
++//
++// Grouped by value type to stay mechanical. Each entry pairs a managedConfig
++// JSON key with the StorageService getter/setter that reads and writes it —
++// the getter is what makes per-field "is this actually different" diffing
++// possible (convention 6). Enum-valued fields live in the string group; the
++// setters themselves validate/narrow.
++//
++// Deliberately excluded (per plan): rest_api_key, mqtt_password,
++// http_basic_auth_password (secrets stay GUI-only), and kiosk_pin (handled by
++// applyPin, out-of-band from config_version gating).
++
++interface FieldSpec<T> {
++  get: () => Promise<T>;
++  set: (value: T) => Promise<void>;
++}
++
++type FieldTable<T> = Record<string, FieldSpec<T>>;
++
++const BOOL_FIELDS: FieldTable<boolean> = {
++  auto_reload: { get: StorageService.getAutoReload, set: StorageService.saveAutoReload },
++  kiosk_enabled: { get: StorageService.getKioskEnabled, set: StorageService.saveKioskEnabled },
++  auto_launch: { get: StorageService.getAutoLaunch, set: StorageService.saveAutoLaunch },
++  screensaver_enabled: { get: StorageService.getScreensaverEnabled, set: StorageService.saveScreensaverEnabled },
++  screensaver_video_loop: { get: StorageService.getScreensaverVideoLoop, set: StorageService.saveScreensaverVideoLoop },
++  screensaver_motion_enabled: { get: StorageService.getScreensaverMotionEnabled, set: StorageService.saveScreensaverMotionEnabled },
++  auto_relaunch_app: { get: StorageService.getAutoRelaunchApp, set: StorageService.saveAutoRelaunchApp },
++  overlay_button_visible: { get: StorageService.getOverlayButtonVisible, set: StorageService.saveOverlayButtonVisible },
++  status_bar_enabled: { get: StorageService.getStatusBarEnabled, set: StorageService.saveStatusBarEnabled },
++  status_bar_on_overlay: { get: StorageService.getStatusBarOnOverlay, set: StorageService.saveStatusBarOnOverlay },
++  status_bar_on_return: { get: StorageService.getStatusBarOnReturn, set: StorageService.saveStatusBarOnReturn },
++  status_bar_show_battery: { get: StorageService.getStatusBarShowBattery, set: StorageService.saveStatusBarShowBattery },
++  status_bar_show_wifi: { get: StorageService.getStatusBarShowWifi, set: StorageService.saveStatusBarShowWifi },
++  status_bar_show_bluetooth: { get: StorageService.getStatusBarShowBluetooth, set: StorageService.saveStatusBarShowBluetooth },
++  status_bar_show_volume: { get: StorageService.getStatusBarShowVolume, set: StorageService.saveStatusBarShowVolume },
++  status_bar_show_time: { get: StorageService.getStatusBarShowTime, set: StorageService.saveStatusBarShowTime },
++  battery_lock_enabled: { get: StorageService.getBatteryLockEnabled, set: StorageService.saveBatteryLockEnabled },
++  url_rotation_enabled: { get: StorageService.getUrlRotationEnabled, set: StorageService.saveUrlRotationEnabled },
++  url_planner_enabled: { get: StorageService.getUrlPlannerEnabled, set: StorageService.saveUrlPlannerEnabled },
++  rest_api_enabled: { get: StorageService.getRestApiEnabled, set: StorageService.saveRestApiEnabled },
++  rest_api_allow_control: { get: StorageService.getRestApiAllowControl, set: StorageService.saveRestApiAllowControl },
++  allow_power_button: { get: StorageService.getAllowPowerButton, set: StorageService.saveAllowPowerButton },
++  allow_notifications: { get: StorageService.getAllowNotifications, set: StorageService.saveAllowNotifications },
++  allow_system_info: { get: StorageService.getAllowSystemInfo, set: StorageService.saveAllowSystemInfo },
++  volume_up_5tap_enabled: { get: StorageService.getVolumeUp5TapEnabled, set: StorageService.saveVolumeUp5TapEnabled },
++  blocking_overlays_enabled: { get: StorageService.getBlockingOverlaysEnabled, set: StorageService.saveBlockingOverlaysEnabled },
++  webview_back_button_enabled: { get: StorageService.getWebViewBackButtonEnabled, set: StorageService.saveWebViewBackButtonEnabled },
++  auto_brightness_enabled: { get: StorageService.getAutoBrightnessEnabled, set: StorageService.saveAutoBrightnessEnabled },
++  brightness_management_enabled: { get: StorageService.getBrightnessManagementEnabled, set: StorageService.saveBrightnessManagementEnabled },
++  screen_scheduler_enabled: { get: StorageService.getScreenSchedulerEnabled, set: StorageService.saveScreenSchedulerEnabled },
++  screen_scheduler_wake_on_touch: { get: StorageService.getScreenSchedulerWakeOnTouch, set: StorageService.saveScreenSchedulerWakeOnTouch },
++  keep_screen_on: { get: StorageService.getKeepScreenOn, set: StorageService.saveKeepScreenOn },
++  auto_wake_on_screen_off: { get: StorageService.getAutoWakeOnScreenOff, set: StorageService.saveAutoWakeOnScreenOff },
++  inactivity_return_enabled: { get: StorageService.getInactivityReturnEnabled, set: StorageService.saveInactivityReturnEnabled },
++  inactivity_return_reset_on_nav: { get: StorageService.getInactivityReturnResetOnNav, set: StorageService.saveInactivityReturnResetOnNav },
++  inactivity_return_clear_cache: { get: StorageService.getInactivityReturnClearCache, set: StorageService.saveInactivityReturnClearCache },
++  inactivity_return_scroll_top: { get: StorageService.getInactivityReturnScrollTop, set: StorageService.saveInactivityReturnScrollTop },
++  url_filter_enabled: { get: StorageService.getUrlFilterEnabled, set: StorageService.saveUrlFilterEnabled },
++  url_filter_show_feedback: { get: StorageService.getUrlFilterShowFeedback, set: StorageService.saveUrlFilterShowFeedback },
++  pdf_viewer_enabled: { get: StorageService.getPdfViewerEnabled, set: StorageService.savePdfViewerEnabled },
++  print_enabled: { get: StorageService.getPrintEnabled, set: StorageService.savePrintEnabled },
++  disable_user_zoom: { get: StorageService.getDisableUserZoom, set: StorageService.saveDisableUserZoom },
++  mqtt_enabled: { get: StorageService.getMqttEnabled, set: StorageService.saveMqttEnabled },
++  mqtt_allow_control: { get: StorageService.getMqttAllowControl, set: StorageService.saveMqttAllowControl },
++  mqtt_motion_always_on: { get: StorageService.getMqttMotionAlwaysOn, set: StorageService.saveMqttMotionAlwaysOn },
++  beta_updates_enabled: { get: StorageService.getBetaUpdatesEnabled, set: StorageService.saveBetaUpdatesEnabled },
++  dashboard_mode_enabled: { get: StorageService.getDashboardModeEnabled, set: StorageService.saveDashboardModeEnabled },
++  media_player_autoplay: { get: StorageService.getMediaPlayerAutoPlay, set: StorageService.saveMediaPlayerAutoPlay },
++  media_player_loop: { get: StorageService.getMediaPlayerLoop, set: StorageService.saveMediaPlayerLoop },
++  media_player_shuffle: { get: StorageService.getMediaPlayerShuffle, set: StorageService.saveMediaPlayerShuffle },
++  media_player_show_controls: { get: StorageService.getMediaPlayerShowControls, set: StorageService.saveMediaPlayerShowControls },
++  media_player_transition: { get: StorageService.getMediaPlayerTransition, set: StorageService.saveMediaPlayerTransition },
++  media_player_mute: { get: StorageService.getMediaPlayerMute, set: StorageService.saveMediaPlayerMute },
++};
++
++// String + enum fields. Enum getters/setters are typed narrower than string;
++// the cast is safe because the setter validates and this is an external
++// config boundary.
++const STRING_FIELDS: FieldTable<string> = {
++  url: { get: StorageService.getUrl as () => Promise<string>, set: StorageService.saveUrl },
++  display_mode: { get: StorageService.getDisplayMode as () => Promise<string>, set: StorageService.saveDisplayMode as (v: string) => Promise<void> },
++  external_app_package: { get: StorageService.getExternalAppPackage as () => Promise<string>, set: StorageService.saveExternalAppPackage },
++  external_app_mode: { get: StorageService.getExternalAppMode as () => Promise<string>, set: StorageService.saveExternalAppMode as (v: string) => Promise<void> },
++  pin_mode: { get: StorageService.getPinMode as () => Promise<string>, set: StorageService.savePinMode as (v: string) => Promise<void> },
++  keyboard_mode: { get: StorageService.getKeyboardMode as () => Promise<string>, set: StorageService.saveKeyboardMode },
++  back_button_mode: { get: StorageService.getBackButtonMode as () => Promise<string>, set: StorageService.saveBackButtonMode },
++  return_mode: { get: StorageService.getReturnMode as () => Promise<string>, set: StorageService.saveReturnMode },
++  return_button_position: { get: StorageService.getReturnButtonPosition as () => Promise<string>, set: StorageService.saveReturnButtonPosition },
++  status_bar_theme: { get: StorageService.getStatusBarTheme as () => Promise<string>, set: StorageService.saveStatusBarTheme as (v: string) => Promise<void> },
++  screensaver_type: { get: StorageService.getScreensaverType as () => Promise<string>, set: StorageService.saveScreensaverType as (v: string) => Promise<void> },
++  screensaver_url: { get: StorageService.getScreensaverUrl as () => Promise<string>, set: StorageService.saveScreensaverUrl },
++  motion_camera_position: { get: StorageService.getMotionCameraPosition as () => Promise<string>, set: StorageService.saveMotionCameraPosition as (v: string) => Promise<void> },
++  screensaver_motion_sensitivity: { get: StorageService.getScreensaverMotionSensitivity as () => Promise<string>, set: StorageService.saveScreensaverMotionSensitivity },
++  url_filter_mode: { get: StorageService.getUrlFilterMode as () => Promise<string>, set: StorageService.saveUrlFilterMode },
++  print_paper_size: { get: StorageService.getPrintPaperSize as () => Promise<string>, set: StorageService.savePrintPaperSize },
++  custom_user_agent: { get: StorageService.getCustomUserAgent as () => Promise<string>, set: StorageService.saveCustomUserAgent },
++  battery_lock_message: { get: StorageService.getBatteryLockMessage as () => Promise<string>, set: StorageService.saveBatteryLockMessage },
++  mqtt_broker_url: { get: StorageService.getMqttBrokerUrl as () => Promise<string>, set: StorageService.saveMqttBrokerUrl },
++  mqtt_username: { get: StorageService.getMqttUsername as () => Promise<string>, set: StorageService.saveMqttUsername },
++  mqtt_client_id: { get: StorageService.getMqttClientId as () => Promise<string>, set: StorageService.saveMqttClientId },
++  mqtt_base_topic: { get: StorageService.getMqttBaseTopic as () => Promise<string>, set: StorageService.saveMqttBaseTopic },
++  mqtt_discovery_prefix: { get: StorageService.getMqttDiscoveryPrefix as () => Promise<string>, set: StorageService.saveMqttDiscoveryPrefix },
++  mqtt_device_name: { get: StorageService.getMqttDeviceName as () => Promise<string>, set: StorageService.saveMqttDeviceName },
++  media_player_fit_mode: { get: StorageService.getMediaPlayerFitMode as () => Promise<string>, set: StorageService.saveMediaPlayerFitMode as (v: string) => Promise<void> },
++  media_player_bg_color: { get: StorageService.getMediaPlayerBgColor as () => Promise<string>, set: StorageService.saveMediaPlayerBgColor },
++  http_basic_auth_username: { get: StorageService.getHttpBasicAuthUsername as () => Promise<string>, set: StorageService.saveHttpBasicAuthUsername },
++};
++
++const NUMBER_FIELDS: FieldTable<number> = {
++  pin_max_attempts: { get: StorageService.getPinMaxAttempts, set: StorageService.savePinMaxAttempts },
++  back_button_timer_delay: { get: StorageService.getBackButtonTimerDelay, set: StorageService.saveBackButtonTimerDelay },
++  url_rotation_interval: { get: StorageService.getUrlRotationInterval, set: StorageService.saveUrlRotationInterval },
++  rest_api_port: { get: StorageService.getRestApiPort, set: StorageService.saveRestApiPort },
++  return_tap_count: { get: StorageService.getReturnTapCount, set: StorageService.saveReturnTapCount },
++  return_tap_timeout: { get: StorageService.getReturnTapTimeout, set: StorageService.saveReturnTapTimeout },
++  screensaver_brightness: { get: StorageService.getScreensaverBrightness, set: StorageService.saveScreensaverBrightness },
++  screensaver_inactivity_delay: { get: StorageService.getScreensaverInactivityDelay, set: StorageService.saveScreensaverInactivityDelay },
++  default_brightness: { get: StorageService.getDefaultBrightness, set: StorageService.saveDefaultBrightness },
++  battery_lock_threshold: { get: StorageService.getBatteryLockThreshold, set: StorageService.saveBatteryLockThreshold },
++  battery_warn_threshold: { get: StorageService.getBatteryWarnThreshold, set: StorageService.saveBatteryWarnThreshold },
++  battery_release_threshold: { get: StorageService.getBatteryReleaseThreshold, set: StorageService.saveBatteryReleaseThreshold },
++  battery_warn_step: { get: StorageService.getBatteryWarnStep, set: StorageService.saveBatteryWarnStep },
++  webview_back_button_x_percent: { get: StorageService.getWebViewBackButtonXPercent, set: StorageService.saveWebViewBackButtonXPercent },
++  webview_back_button_y_percent: { get: StorageService.getWebViewBackButtonYPercent, set: StorageService.saveWebViewBackButtonYPercent },
++  auto_brightness_min: { get: StorageService.getAutoBrightnessMin, set: StorageService.saveAutoBrightnessMin },
++  auto_brightness_max: { get: StorageService.getAutoBrightnessMax, set: StorageService.saveAutoBrightnessMax },
++  auto_brightness_offset: { get: StorageService.getAutoBrightnessOffset, set: StorageService.saveAutoBrightnessOffset },
++  inactivity_return_delay: { get: StorageService.getInactivityReturnDelay, set: StorageService.saveInactivityReturnDelay },
++  webview_zoom_level: { get: StorageService.getWebViewZoomLevel, set: StorageService.saveWebViewZoomLevel },
++  mqtt_port: { get: StorageService.getMqttPort, set: StorageService.saveMqttPort },
++  mqtt_status_interval: { get: StorageService.getMqttStatusInterval, set: StorageService.saveMqttStatusInterval },
++  media_player_image_duration: { get: StorageService.getMediaPlayerImageDuration, set: StorageService.saveMediaPlayerImageDuration },
++  media_player_transition_duration: { get: StorageService.getMediaPlayerTransitionDuration, set: StorageService.saveMediaPlayerTransitionDuration },
++};
++
++// Array / object-array fields (convention 2 + 4). Typed loosely as any[]
++// since each setter/getter expects its own element shape; the console-authored
++// JSON is responsible for matching those shapes. Equality is JSON.stringify-
++// based (order-sensitive) — see applyFieldGroup's arrayEquals.
++const ARRAY_FIELDS: FieldTable<any[]> = {
++  url_rotation_list: { get: StorageService.getUrlRotationList, set: StorageService.saveUrlRotationList },
++  url_planner_events: { get: StorageService.getUrlPlannerEvents, set: StorageService.saveUrlPlannerEvents },
++  blocking_overlays_regions: { get: StorageService.getBlockingOverlaysRegions, set: StorageService.saveBlockingOverlaysRegions },
++  screen_scheduler_rules: { get: StorageService.getScreenSchedulerRules, set: StorageService.saveScreenSchedulerRules },
++  url_filter_list: { get: StorageService.getUrlFilterList, set: StorageService.saveUrlFilterList },
++  managed_apps: { get: StorageService.getManagedApps, set: StorageService.saveManagedApps },
++  screensaver_video_items: { get: StorageService.getScreensaverVideoItems, set: StorageService.saveScreensaverVideoItems },
++  media_player_items: { get: StorageService.getMediaPlayerItems, set: StorageService.saveMediaPlayerItems },
++  dashboard_tiles: { get: StorageService.getDashboardTiles, set: StorageService.saveDashboardTiles },
++};
++
++// ---- push-shape helpers (conventions 7-8) -----------------------------------
++
++// Keys that are legitimate at the top level of the restrictions bundle but are
++// not settings fields themselves.
++const RESERVED_KEYS = new Set(['config_version', 'config_fields', 'kiosk_pin', 'kiosk_pin_label']);
++
++const KNOWN_FIELD_KEYS = new Set([
++  ...Object.keys(BOOL_FIELDS),
++  ...Object.keys(STRING_FIELDS),
++  ...Object.keys(NUMBER_FIELDS),
++  ...Object.keys(ARRAY_FIELDS),
++]);
++
++/**
++ * Stable fingerprint of the config payload (sorted keys, PIN siblings
++ * excluded — a per-device PIN rotation legitimately changes the bundle
++ * without a config_version bump and must not look like an unbumped edit).
++ */
++function computeFingerprint(restrictions: Record<string, unknown>): string {
++  const keys = Object.keys(restrictions)
++    .filter((k) => k !== 'kiosk_pin' && k !== 'kiosk_pin_label')
++    .sort();
++  const obj: Record<string, unknown> = {};
++  for (const k of keys) obj[k] = restrictions[k];
++  try {
++    return JSON.stringify(obj);
++  } catch {
++    return keys.join(',');
++  }
++}
++
++/** Parse the optional config_fields manifest: comma-separated string or string array. */
++function parseConfigFields(v: unknown): string[] | undefined {
++  if (typeof v === 'string') return v.split(',').map((s) => s.trim()).filter(Boolean);
++  if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
++  return undefined;
++}
++
++/** Report the per-push status to the console's custom1 column. */
++async function reportConfigAck(
++  native: ManagedConfigNative | undefined,
++  version: string,
++  status: 'Success' | 'Error',
++): Promise<void> {
++  if (!native) return;
++  const ackValue = `Config #${version} ${status}`;
++  try {
++    await native.reportCustom(1, ackValue);
++    console.log(`[ManagedConfig] reported config ack custom1="${ackValue}"`);
++  } catch (e) {
++    console.warn('[ManagedConfig] config_version ack (custom1) failed:', e);
++  }
++}
++
++// ---- PIN (convention 3) ----------------------------------------------------
++
++/**
++ * Apply a top-level kiosk_pin sibling attribute. Runs on EVERY emission,
++ * ungated by config_version. Idempotent: only writes (and acks) on a real
++ * change. Never reports anything derived from the PIN — the ack is the
++ * admin-chosen kiosk_pin_label (or a timestamp fallback).
++ *
++ * Returns true only if the PIN was actually changed.
++ */
++export async function applyPin(
++  restrictions: Record<string, unknown>,
++  native: ManagedConfigNative | undefined,
++): Promise<boolean> {
++  const rawPin = restrictions.kiosk_pin;
++  if (rawPin === undefined || rawPin === null) return false;
++
++  const pin = String(rawPin).padStart(KIOSK_PIN_LENGTH, '0');
++  const unchanged = await securePinMatches(pin);
++  if (unchanged) {
++    console.log('[ManagedConfig] kiosk_pin present but unchanged; skipping');
++    return false;
++  }
++
++  await saveSecurePin(pin);
++
++  // Ack token: the admin-pushed kiosk_pin_label if present, otherwise a
++  // human-readable local "applied at" datetime (never raw epoch ms, and never
++  // anything derived from the PIN itself).
++  const label = restrictions.kiosk_pin_label;
++  const ackValue = label != null ? String(label) : formatLocalDateTime(new Date());
++  try {
++    await native?.reportCustom(2, ackValue);
++    console.log(`[ManagedConfig] PIN updated, reported ack custom2=${ackValue}`);
++  } catch (e) {
++    console.warn('[ManagedConfig] PIN ack (custom2) failed:', e);
++  }
++  return true;
++}
++
++/** Local time as "YYYY-MM-DD HH:mm" — sortable in the console's custom2 column. */
++function formatLocalDateTime(d: Date): string {
++  const pad = (n: number) => String(n).padStart(2, '0');
++  return (
++    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
++    `${pad(d.getHours())}:${pad(d.getMinutes())}`
++  );
++}
++
++// ---- bulk apply (version-gated, per-field diffed) --------------------------
++
++type FieldOutcome =
++  | { key: string; outcome: 'applied'; value: unknown }
++  | { key: string; outcome: 'skipped'; value: unknown }
++  | { key: string; outcome: 'error'; reason: string };
++
++export interface BulkApplyResult {
++  applied: { key: string; value: unknown }[];
++  skipped: { key: string; value: unknown }[];
++  errors: { key: string; reason: string }[];
++}
++
++/**
++ * Apply one field group: for every key present in `payload` that this table
++ * knows about, coerce the incoming value, compare it against what's
++ * currently stored, and only write on a genuine difference. A coercion
++ * failure or a thrown write is recorded as an error for THAT KEY ONLY — it
++ * never aborts the rest of the group or the other groups (convention 6: one
++ * bad or unchanged field never discards the whole push).
++ */
++async function applyFieldGroup<T>(
++  payload: Record<string, unknown>,
++  table: FieldTable<T>,
++  coerce: (raw: unknown) => { value: T } | { error: string },
++  equals: (a: T, b: T) => boolean,
++  results: FieldOutcome[],
++): Promise<void> {
++  for (const [key, spec] of Object.entries(table)) {
++    if (!(key in payload)) continue;
++
++    const coerced = coerce(payload[key]);
++    if ('error' in coerced) {
++      results.push({ key, outcome: 'error', reason: coerced.error });
++      continue;
++    }
++
++    try {
++      const current = await spec.get();
++      if (equals(current, coerced.value)) {
++        results.push({ key, outcome: 'skipped', value: coerced.value });
++        continue;
++      }
++      await spec.set(coerced.value);
++      results.push({ key, outcome: 'applied', value: coerced.value });
++    } catch (e) {
++      results.push({ key, outcome: 'error', reason: e instanceof Error ? e.message : String(e) });
++    }
++  }
++}
++
++const scalarEquals = <T,>(a: T, b: T) => a === b;
++const arrayEquals = (a: any[], b: any[]) => JSON.stringify(a) === JSON.stringify(b);
++
++/**
++ * Apply the flattened restrictions bundle's fields. Assumes the caller has
++ * already decided config_version changed.
++ */
++async function applyBulk(payload: Record<string, unknown>): Promise<BulkApplyResult> {
++  const results: FieldOutcome[] = [];
++
++  await applyFieldGroup<boolean>(payload, BOOL_FIELDS, (v) => ({ value: toBool(v) }), scalarEquals, results);
++  await applyFieldGroup<string>(payload, STRING_FIELDS, (v) => ({ value: toStr(v) }), scalarEquals, results);
++  await applyFieldGroup<number>(
++    payload,
++    NUMBER_FIELDS,
++    (v) => {
++      const n = toNum(v);
++      return n !== undefined ? { value: n } : { error: `"${String(v)}" is not a finite number` };
++    },
++    scalarEquals,
++    results,
++  );
++  await applyFieldGroup<any[]>(
++    payload,
++    ARRAY_FIELDS,
++    (v) => {
++      const list = resolveList(v);
++      return list !== undefined ? { value: list } : { error: 'value is not an array (and not the ["__CLEAR__"] sentinel)' };
++    },
++    arrayEquals,
++    results,
++  );
++
++  return {
++    applied: results
++      .filter((r): r is { key: string; outcome: 'applied'; value: unknown } => r.outcome === 'applied')
++      .map((r) => ({ key: r.key, value: r.value })),
++    skipped: results
++      .filter((r): r is { key: string; outcome: 'skipped'; value: unknown } => r.outcome === 'skipped')
++      .map((r) => ({ key: r.key, value: r.value })),
++    errors: results
++      .filter((r): r is { key: string; outcome: 'error'; reason: string } => r.outcome === 'error')
++      .map((r) => ({ key: r.key, reason: r.reason })),
++  };
++}
++
++export interface ApplyResult {
++  /** PIN was changed (never triggers a reload). */
++  pinChanged: boolean;
++  /** At least one bulk field was actually written (triggers a live reload). */
++  bulkApplied: boolean;
++}
++
++/**
++ * Top-level entry: apply an incoming restrictions bundle.
++ *
++ * `restrictions` is the whole App Restrictions object as read by the native
++ * module. Per convention 5, the launcher flattens the managedConfig
++ * attribute's JSON keys directly into the top level of this bundle — there is
++ * no nested `managedConfig` object on the device. So `config_version`, every
++ * setting key, and the PIN siblings (`kiosk_pin`, `kiosk_pin_label`) all live
++ * directly on `restrictions`.
++ */
++export async function applyManagedConfig(
++  restrictions: Record<string, unknown> | null | undefined,
++  native: ManagedConfigNative | undefined,
++): Promise<ApplyResult> {
++  const result: ApplyResult = { pinChanged: false, bulkApplied: false };
++  if (!restrictions) {
++    console.log('[ManagedConfig] no restrictions bundle; nothing to apply');
++    return result;
++  }
++  console.log('[ManagedConfig] restrictions received, keys=', Object.keys(restrictions));
++
++  // 1. PIN — ungated, every emission (top-level kiosk_pin).
++  try {
++    result.pinChanged = await applyPin(restrictions, native);
++  } catch (e) {
++    console.warn('[ManagedConfig] applyPin failed:', e);
++  }
++
++  // 2 + 3. Bulk config, gated on config_version — read from the TOP LEVEL of
++  // the (flattened) restrictions bundle, not a nested object.
++  const incomingVersion =
++    restrictions.config_version !== undefined && restrictions.config_version !== null
++      ? String(restrictions.config_version)
++      : undefined;
++
++  if (incomingVersion === undefined) {
++    console.log('[ManagedConfig] no config_version present; skipping bulk apply (PIN-only or empty push)');
++    return result;
++  }
++
++  const lastVersion = await StorageService.getManagedConfigVersion();
++  console.log(`[ManagedConfig] config_version incoming=${incomingVersion} last=${lastVersion ?? '(none)'}`);
++
++  const fingerprint = computeFingerprint(restrictions);
++
++  // Convention 7a: same version — routine re-delivery vs unbumped edit.
++  if (incomingVersion === lastVersion) {
++    const lastFingerprint = await StorageService.getManagedConfigFingerprint();
++    if (lastFingerprint !== null && lastFingerprint !== fingerprint) {
++      logError(
++        native,
++        `config #${incomingVersion} rejected — payload content changed but config_version was not bumped (still ${incomingVersion}). Increment config_version for these changes to apply.`,
++      );
++      await reportConfigAck(native, incomingVersion, 'Error');
++    } else {
++      console.log('[ManagedConfig] config_version unchanged; skipping bulk apply (routine re-delivery)');
++    }
++    return result;
++  }
++
++  // Convention 7b: numeric version regression.
++  const incomingNum = Number(incomingVersion);
++  const lastNum = lastVersion !== null ? Number(lastVersion) : NaN;
++  if (Number.isFinite(incomingNum) && Number.isFinite(lastNum) && incomingNum < lastNum) {
++    logError(
++      native,
++      `config #${incomingVersion} rejected — version regression (incoming ${incomingVersion} is lower than last applied ${lastVersion}). Use a config_version higher than ${lastVersion}.`,
++    );
++    await reportConfigAck(native, incomingVersion, 'Error');
++    return result;
++  }
++
++  // Convention 8: push-shape validation — unknown keys and the optional
++  // config_fields manifest. Non-blocking: valid fields still apply below.
++  const shapeErrors: string[] = [];
++  const unknownKeys = Object.keys(restrictions).filter(
++    (k) => !KNOWN_FIELD_KEYS.has(k) && !RESERVED_KEYS.has(k),
++  );
++  if (unknownKeys.length > 0) {
++    shapeErrors.push(
++      `unrecognized field(s) [${unknownKeys.join(', ')}] — check spelling and case (keys are case-sensitive)`,
++    );
++  }
++  const announced = parseConfigFields(restrictions.config_fields);
++  if (announced) {
++    const announcedUnknown = announced.filter((k) => !KNOWN_FIELD_KEYS.has(k));
++    if (announcedUnknown.length > 0) {
++      shapeErrors.push(`config_fields announces unknown field name(s) [${announcedUnknown.join(', ')}]`);
++    }
++    const missingAnnounced = announced.filter((k) => KNOWN_FIELD_KEYS.has(k) && !(k in restrictions));
++    if (missingAnnounced.length > 0) {
++      shapeErrors.push(
++        `field(s) announced in config_fields but missing from the delivered payload [${missingAnnounced.join(', ')}] — likely dropped upstream by the launcher parser (unquoted decimal, or a number beyond 32-bit range?)`,
++      );
++    }
++  }
++  for (const msg of shapeErrors) {
++    logError(native, `config #${incomingVersion} — ${msg}`);
++  }
++
++  const bulkResult = await applyBulk(restrictions);
++  await StorageService.saveManagedConfigVersion(incomingVersion);
++  await StorageService.saveManagedConfigFingerprint(fingerprint);
++  result.bulkApplied = bulkResult.applied.length > 0;
++
++  const status: 'Success' | 'Error' =
++    bulkResult.errors.length === 0 && shapeErrors.length === 0 ? 'Success' : 'Error';
++
++  // Three independent business-outcome logs, each only emitted when there's
++  // something to say, each carrying the actual field value (not just the key
++  // name) so the log line is self-sufficient without cross-referencing the
++  // push that caused it.
++  if (bulkResult.applied.length > 0) {
++    const appliedStr = bulkResult.applied.map((f) => `${f.key} = ${formatValue(f.value)}`).join(', ');
++    logInfo(native, `config #${incomingVersion} applied successfully. Applied [${appliedStr}]`);
++  }
++  if (bulkResult.skipped.length > 0) {
++    const skippedStr = bulkResult.skipped.map((f) => `${f.key} = ${formatValue(f.value)}`).join(', ');
++    logWarn(native, `config #${incomingVersion} — already matched device [${skippedStr}]`);
++  }
++  if (bulkResult.errors.length > 0) {
++    const errorStr = bulkResult.errors.map((e) => `${e.key} (${e.reason})`).join('; ');
++    logError(native, `config #${incomingVersion} had ${bulkResult.errors.length} field failure(s): ${errorStr}`);
++  }
++  if (bulkResult.applied.length === 0 && bulkResult.skipped.length === 0 && bulkResult.errors.length === 0) {
++    logInfo(native, `config #${incomingVersion} — no known fields present in payload`);
++  }
++
++  // Ack on every version advance (even a fully-skipped, no-op push), so the
++  // console's custom1 column reliably reflects "device saw version N" and
++  // whether it fully succeeded.
++  await reportConfigAck(native, incomingVersion, status);
++
++  return result;
++}
+diff --git a/src/utils/kioskScreenActions.ts b/src/utils/kioskScreenActions.ts
+new file mode 100644
+index 0000000..32a2cbb
+--- /dev/null
++++ b/src/utils/kioskScreenActions.ts
+@@ -0,0 +1,24 @@
++/**
++ * Live-reload registration for KioskScreen.
++ *
++ * Lets the managed-config applier refresh currently-loaded settings on the
++ * mounted Kiosk screen directly — no navigation, no remount, no reboot —
++ * exactly matching how PIN changes already take effect (read fresh at
++ * PIN-entry time, nothing to refresh). React Navigation's native-stack keeps
++ * KioskScreen mounted in the background when Settings/Pin are pushed on top
++ * (no `unmountOnBlur`), so calling reloadSettings() here is always safe: if
++ * Kiosk is the foreground screen the update is visible instantly; if not, the
++ * background screen is quietly refreshed and shows the new state the moment
++ * the user navigates back — either way nothing is ever interrupted mid-edit.
++ *
++ * KioskScreen registers itself on mount / clears on unmount; a plain module
++ * ref (not a React ref) is used because the applier lives outside the
++ * component tree (called from a native-event listener at the app root).
++ */
++export interface KioskScreenActions {
++  reloadSettings: () => void;
++}
++
++export const kioskScreenActionsRef: { current: KioskScreenActions | null } = {
++  current: null,
++};
+diff --git a/src/utils/secureStorage.ts b/src/utils/secureStorage.ts
+index 4dbb58e..827f521 100644
+--- a/src/utils/secureStorage.ts
++++ b/src/utils/secureStorage.ts
+@@ -454,6 +454,38 @@ export async function hasSecurePin(): Promise<boolean> {
+   }
+ }
+ 
++/**
++ * Side-effect-free check of whether a candidate PIN equals the currently
++ * stored one — re-hashes the candidate with the stored salt and compares.
++ *
++ * Unlike verifySecurePin(), this records NO failed attempt and never triggers
++ * lockout, because it is not an authentication path: it exists only so the
++ * managed-config apply loop can decide whether an incoming remote PIN push is
++ * a real change (and skip re-saving / re-acking if it isn't). Never wire this
++ * into a user-facing unlock flow.
++ *
++ * Returns false when there is no stored PBKDF2 PIN (e.g. only a legacy
++ * plaintext PIN, or none) so the caller treats the push as a change and lets
++ * saveSecurePin() establish the secure record.
++ */
++export async function securePinMatches(candidatePin: string): Promise<boolean> {
++  try {
++    const credentials = await Keychain.getGenericPassword({ service: PIN_SERVICE });
++    if (!credentials) {
++      return false;
++    }
++    const { hash, salt } = JSON.parse(credentials.password);
++    if (typeof hash !== 'string' || typeof salt !== 'string') {
++      return false;
++    }
++    const candidateHash = await hashPin(candidatePin, hexToBytes(salt));
++    return candidateHash === hash;
++  } catch (error) {
++    console.error('[SecureStorage] Error comparing PIN:', error);
++    return false;
++  }
++}
++
+ /**
+  * Migrate old plaintext PIN to secure storage
+  */
+diff --git a/src/utils/storage.ts b/src/utils/storage.ts
+index 98f5f8a..b94abbf 100644
+--- a/src/utils/storage.ts
++++ b/src/utils/storage.ts
+@@ -163,6 +163,13 @@ const KEYS = {
+   DASHBOARD_TILES: '@kiosk_dashboard_tiles',
+   // HTTP Basic Auth
+   HTTP_BASIC_AUTH_USERNAME: '@kiosk_http_basic_auth_username',
++  // Managed config (Headwind MDM App Restrictions): last applied config_version,
++  // used to gate the bulk apply so an unchanged re-delivery is a no-op.
++  MANAGED_CONFIG_VERSION: '@kiosk_managed_config_version',
++  // Fingerprint (stable JSON) of the last applied config payload — used to
++  // distinguish a routine same-version re-delivery (silent skip) from an
++  // operator editing the payload without bumping config_version (an error).
++  MANAGED_CONFIG_FINGERPRINT: '@kiosk_managed_config_fingerprint',
+ };
+ 
+ export const StorageService = {
+@@ -2675,6 +2682,40 @@ export const StorageService = {
+     }
+   },
+ 
++  saveManagedConfigVersion: async (value: string): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.MANAGED_CONFIG_VERSION, value);
++    } catch (error) {
++      console.error('Error saving managed config version:', error);
++    }
++  },
++
++  getManagedConfigVersion: async (): Promise<string | null> => {
++    try {
++      return await AsyncStorage.getItem(KEYS.MANAGED_CONFIG_VERSION);
++    } catch (error) {
++      console.error('Error getting managed config version:', error);
++      return null;
++    }
++  },
++
++  saveManagedConfigFingerprint: async (value: string): Promise<void> => {
++    try {
++      await AsyncStorage.setItem(KEYS.MANAGED_CONFIG_FINGERPRINT, value);
++    } catch (error) {
++      console.error('Error saving managed config fingerprint:', error);
++    }
++  },
++
++  getManagedConfigFingerprint: async (): Promise<string | null> => {
++    try {
++      return await AsyncStorage.getItem(KEYS.MANAGED_CONFIG_FINGERPRINT);
++    } catch (error) {
++      console.error('Error getting managed config fingerprint:', error);
++      return null;
++    }
++  },
++
+   getAllSettings: async (): Promise<Map<string, string | null>> => {
+     try {
+       const allKeys = Object.values(KEYS);

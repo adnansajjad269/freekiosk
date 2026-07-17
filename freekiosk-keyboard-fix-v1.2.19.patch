@@ -1,0 +1,171 @@
+diff --git a/android/app/src/main/java/com/freekiosk/KioskModule.kt b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+index b165be2..82e242a 100644
+--- a/android/app/src/main/java/com/freekiosk/KioskModule.kt
++++ b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+@@ -1140,7 +1140,7 @@ class KioskModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
+     }
+ 
+     /**
+-     * Return the patch feature-flags. Each patch (keyboard-gap, force_text,
++     * Return the patch feature-flags. Each patch (keyboard-fix, force_text,
+      * gboard, boot-splash, keep-screen-on, wakelock) is gated by a boolean in
+      * FreeKioskSettings keyed `patch_<name>_enabled`, defaulting to true (patch
+      * active). Native patches read the pref directly; JS feature patches call
+@@ -1153,7 +1153,7 @@ class KioskModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
+         try {
+             val prefs = reactApplicationContext.getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
+             val keys = arrayOf(
+-                "patch_keyboard_gap", "patch_force_text", "patch_gboard",
++                "patch_keyboard_fix", "patch_force_text", "patch_gboard",
+                 "patch_boot_splash", "patch_keep_screen_on", "patch_wakelock"
+             )
+             val result = com.facebook.react.bridge.Arguments.createMap()
+diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+index b66afde..bce51a1 100644
+--- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+@@ -119,14 +119,20 @@ class MainActivity : ReactActivity() {
+     requestCameraPermission()
+ 
+     // Adjust content padding when the soft keyboard appears.
+-    // In immersive/kiosk mode adjustResize is ignored, so we listen for IME insets
+-    // and manually add bottom padding so WebView form fields stay visible.
+-    val contentView = findViewById<View>(android.R.id.content)
+-    ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
+-      val imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime())
+-      view.setPadding(0, 0, 0, imeInsets.bottom)
+-      insets
+-    }
++    // In immersive/kiosk mode adjustResize is ignored by the framework, so the
++    // IME inset is applied manually as bottom padding on the content view.
++    //
++    // PATCH patch_keyboard_fix (default ON, ADB-toggleable; replaces
++    // patch_keyboard_gap): on some Android 10 devices (Kyocera DuraForce2) the
++    // resting insets dispatch after the IME hides is never delivered, so the
++    // keyboard-height padding sticks — a white band at the bottom of every
++    // screen (web pages AND native screens like PIN) that survives page reloads
++    // and only clears on events that force a window relayout (power menu,
++    // Settings round-trip, reboot). installImeInsetsHandling() therefore adds
++    // two dispatch-independent self-heal mechanisms on API < 30; see the
++    // methods below onCreate. With the patch OFF the behavior is exactly
++    // upstream v1.2.19 (bare insets listener).
++    installImeInsetsHandling()
+ 
+     readExternalAppConfig()
+     ensureBootReceiverEnabled()
+@@ -147,6 +153,106 @@ class MainActivity : ReactActivity() {
+     handleNavigationIntent(intent)
+   }
+ 
++  // ==================== PATCH patch_keyboard_fix (see onCreate) ====================
++  // Self-healing IME bottom padding for API < 30. Replaces patch_keyboard_gap.
++
++  private val imeWatchdogHandler = Handler(Looper.getMainLooper())
++  private var imeWatchdogRunning = false
++
++  private fun installImeInsetsHandling() {
++    val contentView = findViewById<View>(android.R.id.content)
++    val fixEnabled = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++      .getBoolean("patch_keyboard_fix_enabled", true)
++
++    ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
++      val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
++      if (fixEnabled) {
++        applyImeBottomPadding(imeBottom, "insets-dispatch")
++      } else {
++        // Patch OFF: exact upstream v1.2.19 behavior.
++        view.setPadding(0, 0, 0, imeBottom)
++      }
++      insets
++    }
++
++    // The self-heal mechanisms are only needed where the resting insets
++    // dispatch after IME-hide can go missing (observed on Android 10 /
++    // Kyocera DuraForce2). API 30+ delivers IME insets reliably.
++    if (fixEnabled && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
++      window.decorView.viewTreeObserver.addOnGlobalLayoutListener {
++        applyImeBottomPadding(computeImeCoverage(), "global-layout")
++      }
++    }
++  }
++
++  /**
++   * Screen area covered by the IME, computed from the window's visible display
++   * frame — available on every layout pass, independent of insets dispatch.
++   * Coverage below 15% of the root height is treated as "no keyboard" so
++   * transient system-bar insets can't masquerade as one (same heuristic React
++   * Native's ReactRootView uses for its keyboard events).
++   */
++  private fun computeImeCoverage(): Int {
++    val decor = window.decorView
++    val rootHeight = decor.rootView.height
++    if (rootHeight <= 0) return 0
++    val visible = android.graphics.Rect()
++    decor.getWindowVisibleDisplayFrame(visible)
++    val covered = rootHeight - visible.bottom
++    return if (covered > rootHeight * 0.15f) covered else 0
++  }
++
++  private fun applyImeBottomPadding(bottom: Int, source: String) {
++    val contentView = findViewById<View>(android.R.id.content)
++    if (contentView.paddingBottom != bottom) {
++      android.util.Log.i("FreeKioskIME", "bottom padding ${contentView.paddingBottom} -> $bottom ($source)")
++      contentView.setPadding(0, 0, 0, bottom)
++    }
++    if (bottom > 0 && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
++      startImeWatchdog()
++    }
++  }
++
++  // While keyboard padding is applied, periodically force an insets + layout
++  // round-trip with the WindowManager. On devices that never deliver the
++  // IME-hidden insets (the white-band bug) this is the programmatic equivalent
++  // of the events observed to heal the screen — opening the power menu or a
++  // Settings round-trip — so a stale state self-corrects within ~1s. Stops as
++  // soon as the padding is back to 0, so it costs nothing in steady state; and
++  // while the IME is genuinely open the WindowManager keeps reporting the
++  // reduced visible frame, so it cannot oscillate.
++  private fun startImeWatchdog() {
++    if (imeWatchdogRunning) return
++    imeWatchdogRunning = true
++    scheduleImeWatchdogTick()
++  }
++
++  private fun scheduleImeWatchdogTick() {
++    imeWatchdogHandler.postDelayed({
++      val contentView = findViewById<View>(android.R.id.content)
++      if (contentView.paddingBottom <= 0) {
++        imeWatchdogRunning = false
++        return@postDelayed
++      }
++      val covered = computeImeCoverage()
++      if (covered != contentView.paddingBottom) {
++        android.util.Log.i(
++          "FreeKioskIME",
++          "watchdog corrected stale padding ${contentView.paddingBottom} -> $covered"
++        )
++        contentView.setPadding(0, 0, 0, covered)
++      }
++      ViewCompat.requestApplyInsets(contentView)
++      contentView.requestLayout()
++      if (contentView.paddingBottom > 0) {
++        scheduleImeWatchdogTick()
++      } else {
++        imeWatchdogRunning = false
++      }
++    }, 500L)
++  }
++  // ==================== END PATCH patch_keyboard_fix ====================
++
+   override fun onNewIntent(intent: Intent?) {
+     super.onNewIntent(intent)
+     setIntent(intent) // Important: update the intent
+@@ -1007,7 +1113,7 @@ class MainActivity : ReactActivity() {
+       try {
+         val pcfg = org.json.JSONObject(configJson)
+         val patchKeys = arrayOf(
+-          "patch_keyboard_gap", "patch_force_text", "patch_gboard",
++          "patch_keyboard_fix", "patch_force_text", "patch_gboard",
+           "patch_boot_splash", "patch_keep_screen_on", "patch_wakelock"
+         )
+         val flagPrefs = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)

@@ -1,0 +1,133 @@
+diff --git a/android/app/src/main/java/com/freekiosk/KioskModule.kt b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+index b165be2..d310eca 100644
+--- a/android/app/src/main/java/com/freekiosk/KioskModule.kt
++++ b/android/app/src/main/java/com/freekiosk/KioskModule.kt
+@@ -1165,4 +1165,90 @@ class KioskModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
+             promise.reject("ERROR", "Failed to get patch flags: ${e.message}")
+         }
+     }
++
++    /**
++     * PATCH patch_gboard (default ON, ADB-toggleable): force the system default
++     * keyboard (IME) so every field on the LAAM page presents the same keyboard.
++     *
++     * `target`:
++     *   ""/"system"  -> no-op (leave the OS default).
++     *   "gboard"     -> resolve and enforce Google Keyboard
++     *                   (package com.google.android.inputmethod.latin).
++     *   anything else -> treated as an IME id or package-name prefix to match.
++     *
++     * Uses WRITE_SECURE_SETTINGS (same permission/pattern AccessibilityModule
++     * uses): append the IME id to ENABLED_INPUT_METHODS if missing, then set
++     * DEFAULT_INPUT_METHOD to it. If the patch flag is OFF, the target IME isn't
++     * installed, or the permission isn't granted, resolve WITHOUT changing
++     * anything — never crash the kiosk over a keyboard.
++     */
++    @ReactMethod
++    fun setDefaultKeyboard(target: String, promise: Promise) {
++        try {
++            val patchOn = reactApplicationContext
++                .getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++                .getBoolean("patch_gboard_enabled", true)
++            if (!patchOn) {
++                android.util.Log.d("KioskModule", "setDefaultKeyboard: patch_gboard disabled — no-op")
++                promise.resolve("patch_disabled")
++                return
++            }
++
++            val want = target.trim()
++            if (want.isEmpty() || want.equals("system", ignoreCase = true)) {
++                android.util.Log.d("KioskModule", "setDefaultKeyboard: no-op (system default)")
++                promise.resolve("system")
++                return
++            }
++
++            val matchPrefix = if (want.equals("gboard", ignoreCase = true))
++                "com.google.android.inputmethod.latin" else want
++
++            val imm = reactApplicationContext
++                .getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
++            val installed = imm.inputMethodList
++            val ime = installed.firstOrNull { it.id == want }
++                ?: installed.firstOrNull { it.id.contains(matchPrefix) || it.packageName == matchPrefix }
++
++            if (ime == null) {
++                android.util.Log.w("KioskModule",
++                    "setDefaultKeyboard: IME matching '$want' not installed — leaving current default")
++                promise.resolve("not_found")
++                return
++            }
++
++            val imeId = ime.id
++            val resolver = reactApplicationContext.contentResolver
++
++            val enabled = android.provider.Settings.Secure.getString(
++                resolver, android.provider.Settings.Secure.ENABLED_INPUT_METHODS
++            ) ?: ""
++            if (!enabled.split(":").any { it == imeId }) {
++                val newEnabled = if (enabled.isEmpty()) imeId else "$enabled:$imeId"
++                android.provider.Settings.Secure.putString(
++                    resolver, android.provider.Settings.Secure.ENABLED_INPUT_METHODS, newEnabled
++                )
++            }
++
++            val current = android.provider.Settings.Secure.getString(
++                resolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD
++            )
++            if (current != imeId) {
++                android.provider.Settings.Secure.putString(
++                    resolver, android.provider.Settings.Secure.DEFAULT_INPUT_METHOD, imeId
++                )
++                android.util.Log.d("KioskModule", "setDefaultKeyboard: default IME set to $imeId")
++            } else {
++                android.util.Log.d("KioskModule", "setDefaultKeyboard: $imeId already default")
++            }
++            promise.resolve(imeId)
++        } catch (se: SecurityException) {
++            android.util.Log.w("KioskModule",
++                "setDefaultKeyboard: WRITE_SECURE_SETTINGS not granted (${se.message}) — leaving current default")
++            promise.resolve("permission_denied")
++        } catch (e: Exception) {
++            android.util.Log.e("KioskModule", "setDefaultKeyboard failed: ${e.message}")
++            promise.resolve("error")
++        }
++    }
+ }
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index d8c4da5..746446f 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -1579,6 +1579,17 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+         console.error('[KioskScreen] Error setting keep screen on:', error);
+       }
+ 
++      // PATCH patch_gboard (default ON, ADB-toggleable): enforce Gboard as the
++      // device default IME on every launch so all fields present the same
++      // keyboard. setDefaultKeyboard self-gates on the patch flag and no-ops
++      // safely if Gboard isn't installed or WRITE_SECURE_SETTINGS is missing.
++      try {
++        const kbResult = await KioskModule.setDefaultKeyboard?.('gboard');
++        console.log('[KioskScreen] Default keyboard (gboard):', kbResult);
++      } catch (error) {
++        console.error('[KioskScreen] Error setting default keyboard:', error);
++      }
++
+       // Load Auto Wake on Screen Off setting
+       const savedAutoWakeOnScreenOff = bool(K.AUTO_WAKE_ON_SCREEN_OFF, false);
+       try {
+diff --git a/src/utils/KioskModule.ts b/src/utils/KioskModule.ts
+index eadc59f..c4881c5 100644
+--- a/src/utils/KioskModule.ts
++++ b/src/utils/KioskModule.ts
+@@ -40,6 +40,11 @@ interface KioskModuleInterface {
+   // Patch feature-flags: { patch_<name>_enabled: boolean }, each defaulting to
+   // true. Gates the JS-side feature patches. Set via ADB (see MainActivity).
+   getPatchFlags(): Promise<Record<string, boolean>>;
++  // Force the system default keyboard (IME): '' / 'system' = leave OS default,
++  // 'gboard' = enforce Google Keyboard. Self-gates on patch_gboard. Resolves with
++  // the applied IME id or a status ('patch_disabled' | 'system' | 'not_found' |
++  // 'permission_denied' | 'error').
++  setDefaultKeyboard(target: string): Promise<string>;
+ }
+ 
+ const { KioskModule } = NativeModules;

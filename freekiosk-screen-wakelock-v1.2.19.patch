@@ -1,0 +1,129 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index 4741bac..d55791d 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -24,10 +24,63 @@ import type { RootStackParamList } from '../navigation/AppNavigator';
+ 
+ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
+ 
++// PATCH patch_wakelock — When "Keep Screen On" is OFF the user expects the OS
++// screen timeout to sleep the display. But the LAAM web app holds a Screen Wake
++// Lock (navigator.wakeLock), which the Chromium WebView honors and which keeps
++// the screen awake regardless of the native window flag. This script neutralizes
++// it: it stubs navigator.wakeLock.request so any lock the page asks for is
++// returned already-released (the system is never actually held awake), and
++// releases anything currently held. The original request fn is stashed on
++// window.__fkWakeOrig so it can be restored if the setting is turned back on.
++// Ends with `true;` to silence react-native-webview's injection warning.
++const WAKE_LOCK_NEUTRALIZE_JS = `
++(function(){
++  try {
++    if (!('wakeLock' in navigator)) return;
++    if (!window.__fkWakeOrig) {
++      window.__fkWakeOrig = navigator.wakeLock.request.bind(navigator.wakeLock);
++    }
++    if (window.__fkWakeSentinels) {
++      window.__fkWakeSentinels.forEach(function(s){ try { s.release && s.release(); } catch(e){} });
++    }
++    window.__fkWakeSentinels = [];
++    navigator.wakeLock.request = function(){
++      var listeners = [];
++      var sentinel = {
++        released: true, type: 'screen', onrelease: null,
++        release: function(){ return Promise.resolve(); },
++        addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
++        removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++      };
++      setTimeout(function(){
++        listeners.forEach(function(cb){ try { cb(); } catch(e){} });
++        if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
++      }, 0);
++      return Promise.resolve(sentinel);
++    };
++  } catch(e){}
++})();
++true;
++`;
++
++// Restore the real navigator.wakeLock.request (used when "Keep Screen On" is
++// switched back ON, or the patch is disabled, without a page reload).
++const WAKE_LOCK_RESTORE_JS = `
++(function(){
++  try {
++    if (window.__fkWakeOrig && ('wakeLock' in navigator)) {
++      navigator.wakeLock.request = window.__fkWakeOrig;
++    }
++  } catch(e){}
++})();
++true;
++`;
++
+ interface WebViewComponentProps {
+   url: string;
+   autoReload: boolean;
+   keyboardMode?: string; // 'default', 'force_numeric', 'smart'
++  keepScreenOn?: boolean; // when false (and patch_wakelock on), neutralize the page's navigator.wakeLock so the screen can sleep
+   onUserInteraction?: (event?: { isTap?: boolean; x?: number; y?: number }) => void; // callback optionnel pour interaction utilisateur
+   jsToExecute?: string; // JavaScript code to execute from API
+   onJsExecuted?: () => void; // callback when JS is executed
+@@ -58,6 +111,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   url, 
+   autoReload,
+   keyboardMode = 'default',
++  keepScreenOn = true,
+   onUserInteraction,
+   jsToExecute,
+   onJsExecuted,
+@@ -85,9 +139,15 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   // keyboard mode. Defaults to true and stays true if getPatchFlags is absent
+   // (base patch not applied), so this feature patch works standalone.
+   const [forceTextPatchEnabled, setForceTextPatchEnabled] = useState<boolean>(true);
++  // PATCH patch_wakelock (default ON, ADB-toggleable): gate the wake-lock
++  // neutralizer. Defaults true and stays true if getPatchFlags is absent.
++  const [wakelockPatchEnabled, setWakelockPatchEnabled] = useState<boolean>(true);
+   React.useEffect(() => {
+     KioskModule.getPatchFlags?.()
+-      .then((flags) => setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false))
++      .then((flags) => {
++        setForceTextPatchEnabled(flags?.patch_force_text_enabled !== false);
++        setWakelockPatchEnabled(flags?.patch_wakelock_enabled !== false);
++      })
+       .catch(() => {});
+   }, []);
+   const blockedUrlTimerRef = useRef<any>(null);
+@@ -644,7 +704,22 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+     return '';
+   };
+ 
+-  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript();
++  // PATCH patch_wakelock: inject the wake-lock neutralizer at page load only when
++  // Keep Screen On is OFF and the patch is enabled. Otherwise contributes nothing.
++  const wakeLockActive = keepScreenOn === false && wakelockPatchEnabled;
++  const getWakeLockOverrideScript = (): string => {
++    return wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : '';
++  };
++
++  // Apply the wake-lock override live when the setting/flag toggles, without
++  // waiting for a page reload: neutralize when active, restore otherwise.
++  React.useEffect(() => {
++    const wv = webViewRef.current;
++    if (!wv) return;
++    wv.injectJavaScript(wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
++  }, [wakeLockActive]);
++
++  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript() + getWakeLockOverrideScript();
+ 
+   // Gestion des messages venant de la webview
+   const onMessageHandler = (event: any) => {
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index 746446f..3bd07ed 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -2445,6 +2445,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+               url={url}
+               autoReload={autoReload}
+               keyboardMode={keyboardMode}
++              keepScreenOn={keepScreenOn}
+               onUserInteraction={onUserInteraction}
+               jsToExecute={jsToExecute}
+               onJsExecuted={() => setJsToExecute('')}
