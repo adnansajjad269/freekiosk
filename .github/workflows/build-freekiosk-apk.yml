@@ -49,6 +49,7 @@ jobs:
           cp freekiosk-refresh-button-v1.2.19.patch /tmp/refresh-button.patch
           cp freekiosk-webview-render-recovery-v1.2.19.patch /tmp/webview-render-recovery.patch
           cp freekiosk-camera-teardown-v1.2.19.patch /tmp/camera-teardown.patch
+          cp freekiosk-webview-resilience-v1.2.19.patch /tmp/webview-resilience.patch
           # Forks don't always carry the release tags, so pull them from the
           # original FreeKiosk repo, then switch the source tree to that release.
           git remote add upstream https://github.com/RushB-fr/freekiosk.git || true
@@ -129,9 +130,21 @@ jobs:
           # patches above; diffed against the post-recovery tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/camera-teardown.patch
           git add -A
+          # webview-resilience — two WebViewComponent-only changes:
+          # (1) getUserMedia wrapper (document-start): 8s no-settle watchdog +
+          #     one transparent 1.2s retry for the retryable error class,
+          #     absorbing the Kyocera legacy-HAL cold-start race that camera
+          #     teardown alone cannot remove (it is below the app). Full
+          #     [FreeKioskCam] logging retained.
+          # (2) the PDF-link MutationObserver is debounced (500ms) — it used to
+          #     rescan every anchor on every DOM mutation, visibly delaying tap
+          #     handling on heavy SPA pages (1000+ card lists) on slow CPUs.
+          # Applied last; diffed against the post-camera-teardown tree.
+          git apply --3way --verbose --whitespace=nowarn /tmp/webview-resilience.patch
+          git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 56/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.33"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 57/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.34"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"

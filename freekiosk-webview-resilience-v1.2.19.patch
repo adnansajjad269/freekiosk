@@ -1,0 +1,121 @@
+diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
+index 6be3b4f..7ede75a 100644
+--- a/src/components/WebViewComponent.tsx
++++ b/src/components/WebViewComponent.tsx
+@@ -76,26 +76,66 @@ const WAKE_LOCK_RESTORE_JS = `
+ true;
+ `;
+ 
+-// #camera-teardown diagnostics: log every getUserMedia call and failure (error
+-// name + message + duration) so camera-start failures on device are visible via
+-// `adb logcat` (ReactNativeJS tag). Log-only — no retry, no behavior change.
+-// Installed at document start so it wraps before any page script runs.
+-const CAMERA_DIAG_JS = `
++// #webview-resilience: wrap navigator.mediaDevices.getUserMedia at document
++// start (before any page script runs). Two jobs:
++//  1. Absorb the Kyocera DuraForce2's legacy-HAL cold-start race: the first
++//     camera open of a session reliably fails (or never settles) while the HAL
++//     spins up, and a retry ~1s later reliably succeeds. Chrome tolerates this
++//     inside its own capture service; the WebView's in-process stack does not,
++//     so we do the equivalent one layer up: an 8s no-settle watchdog plus ONE
++//     transparent retry after 1.2s for the retryable error class
++//     (NotReadableError/TrackStartError/AbortError). Anything else — e.g.
++//     NotAllowedError — surfaces to the page unchanged, and a second failure
++//     surfaces too, so the page's own "Try again" UI remains the fallback.
++//  2. Log every call/outcome as [FreeKioskCam] (visible via adb logcat,
++//     ReactNativeJS tag) so field failures name their exact error class.
++// If the watchdog fires and the original open later succeeds, the late
++// stream's tracks are stopped so no live camera is leaked.
++const CAMERA_RESILIENCE_JS = `
+ (function(){
+   try {
+     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+-    if (navigator.mediaDevices.__fkCamDiag) return;
+-    navigator.mediaDevices.__fkCamDiag = true;
++    if (navigator.mediaDevices.__fkCamWrap) return;
++    navigator.mediaDevices.__fkCamWrap = true;
+     var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+-    navigator.mediaDevices.getUserMedia = function(constraints){
++    var RETRYABLE = { NotReadableError: 1, TrackStartError: 1, AbortError: 1 };
++    function attempt(constraints, tag){
+       var t0 = Date.now();
+-      try { console.log('[FreeKioskCam] getUserMedia start ' + JSON.stringify(constraints)); } catch(e) {}
+-      return orig(constraints).then(function(stream){
+-        console.log('[FreeKioskCam] getUserMedia OK in ' + (Date.now()-t0) + 'ms');
+-        return stream;
+-      }, function(err){
+-        console.log('[FreeKioskCam] getUserMedia FAILED in ' + (Date.now()-t0) + 'ms: ' + (err && err.name) + ' - ' + (err && err.message));
+-        throw err;
++      return new Promise(function(resolve, reject){
++        var settled = false;
++        var timer = setTimeout(function(){
++          if (settled) return;
++          settled = true;
++          console.log('[FreeKioskCam] ' + tag + ' never settled - watchdog fired at 8s');
++          reject(new DOMException('Camera start timed out', 'AbortError'));
++        }, 8000);
++        orig(constraints).then(function(stream){
++          if (settled) {
++            // Watchdog already gave up - stop the late stream so the camera is
++            // not left running with no owner.
++            try { stream.getTracks().forEach(function(t){ t.stop(); }); } catch(e) {}
++            return;
++          }
++          settled = true; clearTimeout(timer);
++          console.log('[FreeKioskCam] ' + tag + ' OK in ' + (Date.now()-t0) + 'ms');
++          resolve(stream);
++        }, function(err){
++          if (settled) return;
++          settled = true; clearTimeout(timer);
++          console.log('[FreeKioskCam] ' + tag + ' FAILED in ' + (Date.now()-t0) + 'ms: ' + (err && err.name) + ' - ' + (err && err.message));
++          reject(err);
++        });
++      });
++    }
++    navigator.mediaDevices.getUserMedia = function(constraints){
++      try { console.log('[FreeKioskCam] getUserMedia ' + JSON.stringify(constraints)); } catch(e) {}
++      return attempt(constraints, 'attempt#1').catch(function(err){
++        var name = err && err.name;
++        if (!RETRYABLE[name]) throw err;
++        console.log('[FreeKioskCam] retrying once in 1200ms (' + name + ')');
++        return new Promise(function(r){ setTimeout(r, 1200); }).then(function(){
++          return attempt(constraints, 'attempt#2');
++        });
+       });
+     };
+   } catch(e){}
+@@ -616,9 +656,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+           }
+         });
+       }
+-      // Run immediately and watch for DOM changes (SPAs)
++      // Run immediately and watch for DOM changes (SPAs).
++      // #webview-resilience: debounced. The observer used to run a full
++      // querySelectorAll('a[href]') scan on EVERY mutation batch — on heavy
++      // SPA pages (e.g. a 1000+ card list) that is O(anchors x mutations) of
++      // main-thread work and visibly delays tap handling on slow CPUs. A
++      // 500ms trailing debounce collapses mutation storms to at most two
++      // scans per second; a freshly rendered PDF link is intercepted at most
++      // half a second late, which is imperceptible.
+       interceptPdfLinks();
+-      var pdfObserver = new MutationObserver(interceptPdfLinks);
++      var _fkPdfScanPending = null;
++      var pdfObserver = new MutationObserver(function() {
++        if (_fkPdfScanPending) return;
++        _fkPdfScanPending = setTimeout(function() {
++          _fkPdfScanPending = null;
++          interceptPdfLinks();
++        }, 500);
++      });
+       pdfObserver.observe(document.body, { childList: true, subtree: true });
+     }
+   })();
+@@ -980,7 +1034,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+         }}
+         onError={handleError}
+         onRenderProcessGone={handleRenderProcessGone}
+-        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
++        injectedJavaScriptBeforeContentLoaded={CAMERA_RESILIENCE_JS}
+ 
+         javaScriptEnabled={true}
+         domStorageEnabled={true}
