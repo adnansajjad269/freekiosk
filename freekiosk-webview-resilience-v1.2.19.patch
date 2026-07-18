@@ -1,8 +1,8 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..e7ca6b5 100644
+index 6be3b4f..cc450f7 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
-@@ -37,27 +37,38 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
+@@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
  (function(){
    try {
      if (!('wakeLock' in navigator)) return;
@@ -40,15 +40,26 @@ index 6be3b4f..e7ca6b5 100644
 +      navigator.wakeLock.request = function(){
 +        var listeners = [];
 +        var sentinel = {
-+          released: true, type: 'screen', onrelease: null,
-+          release: function(){ return Promise.resolve(); },
-+          addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
-+          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++          // #webview-resilience: faithful inert WakeLockSentinel. released starts
++          // false (a just-granted sentinel is NOT released) and release() fires the
++          // event itself — no auto-fire on the next tick, which would loop if the
++          // SPA re-acquires on 'release'. The real navigator.wakeLock is never
++          // touched, so the screen still sleeps while the page believes it holds a
++          // lock (no unhandled rejection, no retry storm).
++          released: false, type: 'screen', onrelease: null,
++          release: function(){
++            if (!sentinel.released) {
++              sentinel.released = true;
++              var ev = { type: 'release', target: sentinel };
++              listeners.forEach(function(cb){ try { cb(ev); } catch(e){} });
++              if (sentinel.onrelease) { try { sentinel.onrelease(ev); } catch(e){} }
++            }
++            return Promise.resolve();
++          },
++          addEventListener: function(t, cb){ if (t === 'release' && cb) listeners.push(cb); },
++          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); },
++          dispatchEvent: function(){ return true; }
 +        };
-+        setTimeout(function(){
-+          listeners.forEach(function(cb){ try { cb(); } catch(e){} });
-+          if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
-+        }, 0);
 +        return Promise.resolve(sentinel);
        };
 -      setTimeout(function(){
@@ -61,7 +72,7 @@ index 6be3b4f..e7ca6b5 100644
    } catch(e){}
  })();
  true;
-@@ -68,7 +79,8 @@ true;
+@@ -68,7 +90,8 @@ true;
  const WAKE_LOCK_RESTORE_JS = `
  (function(){
    try {
@@ -71,7 +82,7 @@ index 6be3b4f..e7ca6b5 100644
        navigator.wakeLock.request = window.__fkWakeOrig;
      }
    } catch(e){}
-@@ -76,26 +88,112 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -76,26 +99,123 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -105,15 +116,26 @@ index 6be3b4f..e7ca6b5 100644
 +      if (window.__fkWakeBlocked) {
 +        var listeners = [];
 +        var sentinel = {
-+          released: true, type: type || 'screen', onrelease: null,
-+          release: function(){ return Promise.resolve(); },
-+          addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
-+          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++          // #webview-resilience: faithful inert WakeLockSentinel. released starts
++          // false (a just-granted sentinel is NOT released) and release() fires the
++          // event itself — no auto-fire on the next tick, which would loop if the
++          // SPA re-acquires on 'release'. The real navigator.wakeLock is never
++          // touched, so the screen still sleeps while the page believes it holds a
++          // lock (no unhandled rejection, no retry storm).
++          released: false, type: type || 'screen', onrelease: null,
++          release: function(){
++            if (!sentinel.released) {
++              sentinel.released = true;
++              var ev = { type: 'release', target: sentinel };
++              listeners.forEach(function(cb){ try { cb(ev); } catch(e){} });
++              if (sentinel.onrelease) { try { sentinel.onrelease(ev); } catch(e){} }
++            }
++            return Promise.resolve();
++          },
++          addEventListener: function(t, cb){ if (t === 'release' && cb) listeners.push(cb); },
++          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); },
++          dispatchEvent: function(){ return true; }
 +        };
-+        setTimeout(function(){
-+          listeners.forEach(function(cb){ try { cb(); } catch(e){} });
-+          if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
-+        }, 0);
 +        return Promise.resolve(sentinel);
 +      }
 +      return origReq(type).then(function(s){
@@ -199,7 +221,7 @@ index 6be3b4f..e7ca6b5 100644
        });
      };
    } catch(e){}
-@@ -616,9 +714,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -616,9 +736,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -225,7 +247,7 @@ index 6be3b4f..e7ca6b5 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -980,7 +1092,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,7 +1114,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
