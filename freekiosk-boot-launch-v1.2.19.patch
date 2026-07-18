@@ -1,0 +1,182 @@
+diff --git a/android/app/src/main/java/com/freekiosk/BootLockActivity.kt b/android/app/src/main/java/com/freekiosk/BootLockActivity.kt
+index b851b48..5321ae2 100644
+--- a/android/app/src/main/java/com/freekiosk/BootLockActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/BootLockActivity.kt
+@@ -40,6 +40,13 @@ class BootLockActivity : Activity() {
+ 
+         /** How often we check whether MainActivity is alive. */
+         private const val POLL_INTERVAL_MS = 1_000L  // 1 second
++
++        /** PATCH patch_boot_splash (#boot-launch): positive confirmation that this
++         *  activity actually reached onCreate. Android 10 silently discards blocked
++         *  background activity launches (no exception reaches the caller), so the
++         *  boot phase in KioskWatchdogService polls this flag to detect a dropped
++         *  launch and retry. */
++        @JvmStatic @Volatile var running = false
+     }
+ 
+     private val handler = Handler(Looper.getMainLooper())
+@@ -52,6 +59,7 @@ class BootLockActivity : Activity() {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        running = true
+ 
+         // Keep screen on & make full-screen immediately
+         window.addFlags(
+@@ -92,6 +100,7 @@ class BootLockActivity : Activity() {
+     }
+ 
+     override fun onDestroy() {
++        running = false
+         handler.removeCallbacks(pollRunnable)
+         super.onDestroy()
+         DebugLog.d(TAG, "onDestroy")
+diff --git a/android/app/src/main/java/com/freekiosk/BootReceiver.kt b/android/app/src/main/java/com/freekiosk/BootReceiver.kt
+index e7d624d..7634830 100644
+--- a/android/app/src/main/java/com/freekiosk/BootReceiver.kt
++++ b/android/app/src/main/java/com/freekiosk/BootReceiver.kt
+@@ -131,8 +131,21 @@ class BootReceiver : BroadcastReceiver() {
+             val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+             val isDeviceOwner = dpm.isDeviceOwnerApp(context.packageName)
+             val kioskEnabled = isKioskEnabled(context)
+-            DebugLog.d("BootReceiver", "Fast boot-lock check: DO=$isDeviceOwner, kiosk=$kioskEnabled")
+-            isDeviceOwner && kioskEnabled
++            // PATCH patch_boot_splash (default ON, ADB-toggleable): fire the
++            // instant native boot splash (BootLockActivity) whenever kiosk mode is
++            // enabled, even if FreeKiosk is NOT itself the Device Owner. On
++            // Headwind MDM fleets the launcher is the Device Owner, so the old
++            // `isDeviceOwner && kioskEnabled` gate was always false and the splash
++            // never showed — leaving the slow ~10-15s RN cold start visible on
++            // boot. The BootLockActivity launch is wrapped in try/catch and falls
++            // back to launchMainActivityLegacy() if a background activity-launch
++            // restriction blocks it, so relaxing the gate cannot regress boot.
++            // When the patch is OFF, restore the original device-owner gate.
++            val bootSplashPatch = context
++                .getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++                .getBoolean("patch_boot_splash_enabled", true)
++            DebugLog.d("BootReceiver", "Fast boot-lock check: DO=$isDeviceOwner, kiosk=$kioskEnabled, patch=$bootSplashPatch")
++            if (bootSplashPatch) kioskEnabled else isDeviceOwner && kioskEnabled
+         } catch (e: Exception) {
+             false
+         }
+@@ -196,6 +209,13 @@ class BootReceiver : BroadcastReceiver() {
+         if (!isKioskEnabled(context)) return
+         try {
+             val serviceIntent = Intent(context, KioskWatchdogService::class.java)
++            // PATCH patch_boot_splash (#boot-launch): tell the watchdog this start is
++            // part of the boot sequence so it runs its accelerated boot-launch phase.
++            // Android 10 silently discards background activity launches from this
++            // receiver (no exception fires), so the direct startActivity above may
++            // have been dropped; the foreground service retries with positive
++            // confirmation. No retry logic runs in this receiver itself.
++            serviceIntent.putExtra(KioskWatchdogService.EXTRA_BOOT_LAUNCH, true)
+             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                 context.startForegroundService(serviceIntent)
+             } else {
+diff --git a/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt b/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
+index 8739174..f2fa626 100644
+--- a/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
++++ b/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
+@@ -39,11 +39,57 @@ class KioskWatchdogService : Service() {
+         private const val NOTIFICATION_ID = 2002
+         private const val CHECK_INTERVAL_MS = 10_000L  // check every 10 s
+         private const val RELAUNCH_COOLDOWN_MS = 15_000L // min 15 s between relaunches
++
++        // PATCH patch_boot_splash (#boot-launch): accelerated boot-launch phase.
++        // BootReceiver's direct startActivity() at boot is a background activity
++        // launch that Android 10 silently discards unless an exemption applies
++        // (e.g. SYSTEM_ALERT_WINDOW granted). Before this phase existed, the first
++        // recovery only happened at this service's first normal tick (+10s) — the
++        // observed "FreeKiosk appears 5-10s after the MDM launcher". The boot
++        // phase retries every ~1.8s (up to 5x, cooldown bypassed) with positive
++        // confirmation via BootLockActivity.running, then hands over to the
++        // normal 10s loop. This service is a START_STICKY foreground service:
++        // retries run on its own handler, never in the receiver.
++        const val EXTRA_BOOT_LAUNCH = "boot_launch"
++        private const val BOOT_PHASE_INTERVAL_MS = 1_800L
++        private const val BOOT_PHASE_MAX_ATTEMPTS = 5
+     }
+ 
+     private val handler = Handler(Looper.getMainLooper())
+     private var isRunning = false
+     private var lastRelaunchTime = 0L
++    private var bootPhaseActive = false
++    private var bootPhaseAttempts = 0
++
++    private val bootPhaseRunnable = object : Runnable {
++        override fun run() {
++            if (!isRunning || !bootPhaseActive) return
++            if (BootLockActivity.running || isMainActivityRunning()) {
++                DebugLog.d(TAG, "Boot phase: FreeKiosk is up (after $bootPhaseAttempts retries)")
++                bootPhaseActive = false
++                return
++            }
++            if (!isKioskEnabled()) {
++                bootPhaseActive = false
++                return
++            }
++            bootPhaseAttempts += 1
++            DebugLog.errorProduction(TAG, "boot launch attempt #$bootPhaseAttempts silently blocked (background-activity-launch restriction) — retrying")
++            try {
++                val intent = Intent(this@KioskWatchdogService, BootLockActivity::class.java)
++                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                startActivity(intent)
++            } catch (e: Exception) {
++                DebugLog.errorProduction(TAG, "Boot phase launch failed: ${e.message}")
++            }
++            if (bootPhaseAttempts < BOOT_PHASE_MAX_ATTEMPTS) {
++                handler.postDelayed(this, BOOT_PHASE_INTERVAL_MS)
++            } else {
++                DebugLog.errorProduction(TAG, "Boot phase exhausted after $BOOT_PHASE_MAX_ATTEMPTS attempts — normal watchdog loop takes over. For deterministic boot launch, grant FreeKiosk the 'Display over other apps' permission (SYSTEM_ALERT_WINDOW).")
++                bootPhaseActive = false
++            }
++        }
++    }
+ 
+     private val checkRunnable = object : Runnable {
+         override fun run() {
+@@ -77,6 +123,17 @@ class KioskWatchdogService : Service() {
+         handler.removeCallbacks(checkRunnable)
+         handler.postDelayed(checkRunnable, CHECK_INTERVAL_MS)
+ 
++        // PATCH patch_boot_splash (#boot-launch): run the accelerated boot phase when
++        // this start came from BootReceiver at boot and the patch is enabled.
++        val bootPatchOn = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++            .getBoolean("patch_boot_splash_enabled", true)
++        if (bootPatchOn && intent?.getBooleanExtra(EXTRA_BOOT_LAUNCH, false) == true && !bootPhaseActive) {
++            bootPhaseActive = true
++            bootPhaseAttempts = 0
++            handler.postDelayed(bootPhaseRunnable, BOOT_PHASE_INTERVAL_MS)
++            DebugLog.d(TAG, "Boot-launch phase armed (first check in ${BOOT_PHASE_INTERVAL_MS}ms)")
++        }
++
+         DebugLog.d(TAG, "Watchdog started (START_STICKY)")
+ 
+         // START_STICKY: Android will restart this service if the process is killed
+diff --git a/android/app/src/main/java/com/freekiosk/MainActivity.kt b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+index 3295bb2..4487901 100644
+--- a/android/app/src/main/java/com/freekiosk/MainActivity.kt
++++ b/android/app/src/main/java/com/freekiosk/MainActivity.kt
+@@ -130,6 +130,21 @@ class MainActivity : ReactActivity() {
+     // Start KioskWatchdogService (#96) — survives OOM kills via START_STICKY
+     startKioskWatchdogIfNeeded()
+ 
++    // PATCH patch_boot_splash (#boot-launch): refresh the device-encrypted-storage
++    // fast-boot flag on every app start, not only at BOOT_COMPLETED. Without this,
++    // the FIRST reboot after enabling kiosk mode misses the instant
++    // LOCKED_BOOT_COMPLETED -> BootLockActivity path (the flag is only persisted
++    // during a boot that already happened). Mirrors the receiver's gate: patched
++    // semantics need kiosk+autolaunch; unpatched semantics additionally need DO.
++    try {
++      val bootPatchOn = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
++        .getBoolean("patch_boot_splash_enabled", true)
++      val autoLaunch = getAsyncStorageValue("@kiosk_auto_launch", "false") == "true"
++      val fastBoot = autoLaunch && isKioskEnabled() &&
++        (bootPatchOn || devicePolicyManager.isDeviceOwnerApp(packageName))
++      BootReceiver.updateDeBootFlag(this, fastBoot)
++    } catch (_: Exception) {}
++
+     // If started from HomeActivity (External App Mode at boot),
+     // move to background so the external app stays in foreground
+     if (intent?.getBooleanExtra("from_home_activity", false) == true) {

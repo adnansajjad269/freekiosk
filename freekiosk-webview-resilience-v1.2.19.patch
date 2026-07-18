@@ -1,8 +1,77 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..7ede75a 100644
+index 6be3b4f..e7ca6b5 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
-@@ -76,26 +76,66 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -37,27 +37,38 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
+ (function(){
+   try {
+     if (!('wakeLock' in navigator)) return;
+-    if (!window.__fkWakeOrig) {
+-      window.__fkWakeOrig = navigator.wakeLock.request.bind(navigator.wakeLock);
+-    }
+-    if (window.__fkWakeSentinels) {
+-      window.__fkWakeSentinels.forEach(function(s){ try { s.release && s.release(); } catch(e){} });
+-    }
+-    window.__fkWakeSentinels = [];
+-    navigator.wakeLock.request = function(){
+-      var listeners = [];
+-      var sentinel = {
+-        released: true, type: 'screen', onrelease: null,
+-        release: function(){ return Promise.resolve(); },
+-        addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
+-        removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++    // #webview-resilience: primary path — flip the document-start gate installed
++    // by the wake-gate script and release every lock it brokered (real sentinels
++    // recorded while unblocked, plus any legacy stub sentinels).
++    window.__fkWakeBlocked = true;
++    [window.__fkRealWakeSentinels, window.__fkWakeSentinels].forEach(function(arr){
++      if (arr && arr.length) {
++        arr.forEach(function(s){ try { s.release && s.release(); } catch(e){} });
++        arr.length = 0;
++      }
++    });
++    if (!navigator.__fkWakeGate) {
++      // Legacy fallback (gate not installed): stub navigator.wakeLock.request in
++      // place so future requests return an already-released sentinel.
++      if (!window.__fkWakeOrig) {
++        window.__fkWakeOrig = navigator.wakeLock.request.bind(navigator.wakeLock);
++      }
++      window.__fkWakeSentinels = [];
++      navigator.wakeLock.request = function(){
++        var listeners = [];
++        var sentinel = {
++          released: true, type: 'screen', onrelease: null,
++          release: function(){ return Promise.resolve(); },
++          addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
++          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++        };
++        setTimeout(function(){
++          listeners.forEach(function(cb){ try { cb(); } catch(e){} });
++          if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
++        }, 0);
++        return Promise.resolve(sentinel);
+       };
+-      setTimeout(function(){
+-        listeners.forEach(function(cb){ try { cb(); } catch(e){} });
+-        if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
+-      }, 0);
+-      return Promise.resolve(sentinel);
+-    };
++    }
+   } catch(e){}
+ })();
+ true;
+@@ -68,7 +79,8 @@ true;
+ const WAKE_LOCK_RESTORE_JS = `
+ (function(){
+   try {
+-    if (window.__fkWakeOrig && ('wakeLock' in navigator)) {
++    window.__fkWakeBlocked = false;
++    if (!navigator.__fkWakeGate && window.__fkWakeOrig && ('wakeLock' in navigator)) {
+       navigator.wakeLock.request = window.__fkWakeOrig;
+     }
+   } catch(e){}
+@@ -76,26 +88,112 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -11,6 +80,52 @@ index 6be3b4f..7ede75a 100644
 -// `adb logcat` (ReactNativeJS tag). Log-only — no retry, no behavior change.
 -// Installed at document start so it wraps before any page script runs.
 -const CAMERA_DIAG_JS = `
++// #webview-resilience: document-start wake-lock gate. Installed BEFORE any page
++// script runs (injectedJavaScriptBeforeContentLoaded), which closes the race the
++// onPageFinished-injected neutralizer cannot cover: a page that acquires its
++// Screen Wake Lock during load (the LAAM SPA does) would otherwise hold a native
++// lock we never brokered and cannot release. The gate wraps
++// navigator.wakeLock.request from the first byte: while window.__fkWakeBlocked
++// it hands out inert already-released sentinels; while unblocked it passes
++// through but records real sentinels in window.__fkRealWakeSentinels so a later
++// block (WAKE_LOCK_NEUTRALIZE_JS) can release locks that were already granted.
++// The initial blocked state is templated from the current Keep-Screen-On/flag
++// state at each page load; NEUTRALIZE/RESTORE flip it live in between.
++const buildWakeGateScript = (initiallyBlocked: boolean): string => `
++(function(){
++  try {
++    if (!('wakeLock' in navigator)) return;
++    window.__fkWakeBlocked = ${initiallyBlocked ? 'true' : 'false'};
++    if (navigator.__fkWakeGate) return;
++    navigator.__fkWakeGate = true;
++    window.__fkRealWakeSentinels = [];
++    var origReq = navigator.wakeLock.request.bind(navigator.wakeLock);
++    window.__fkWakeOrig = origReq;
++    navigator.wakeLock.request = function(type){
++      if (window.__fkWakeBlocked) {
++        var listeners = [];
++        var sentinel = {
++          released: true, type: type || 'screen', onrelease: null,
++          release: function(){ return Promise.resolve(); },
++          addEventListener: function(t, cb){ if (t === 'release') listeners.push(cb); },
++          removeEventListener: function(t, cb){ listeners = listeners.filter(function(l){ return l !== cb; }); }
++        };
++        setTimeout(function(){
++          listeners.forEach(function(cb){ try { cb(); } catch(e){} });
++          if (sentinel.onrelease) { try { sentinel.onrelease(); } catch(e){} }
++        }, 0);
++        return Promise.resolve(sentinel);
++      }
++      return origReq(type).then(function(s){
++        try { window.__fkRealWakeSentinels.push(s); } catch(e){}
++        return s;
++      });
++    };
++  } catch(e){}
++})();
++true;
++`;
++
 +// #webview-resilience: wrap navigator.mediaDevices.getUserMedia at document
 +// start (before any page script runs). Two jobs:
 +//  1. Absorb the Kyocera DuraForce2's legacy-HAL cold-start race: the first
@@ -84,7 +199,7 @@ index 6be3b4f..7ede75a 100644
        });
      };
    } catch(e){}
-@@ -616,9 +656,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -616,9 +714,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -110,12 +225,12 @@ index 6be3b4f..7ede75a 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -980,7 +1034,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,7 +1092,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
-+        injectedJavaScriptBeforeContentLoaded={CAMERA_RESILIENCE_JS}
++        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS}
  
          javaScriptEnabled={true}
          domStorageEnabled={true}

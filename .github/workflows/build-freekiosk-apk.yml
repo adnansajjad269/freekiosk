@@ -35,17 +35,13 @@ jobs:
           # so the build works when dispatched from a feature branch too (the
           # patch may not be on origin/main yet).
           cp freekiosk-managed-config-v1.2.19.patch /tmp/managed-config.patch
-          # Same for the screen-wakelock patch (neutralizes the page's
-          # navigator.wakeLock when Keep Screen On is off, so the screen can
-          # sleep) — copy before the tag checkout so branch dispatches work.
-          cp freekiosk-screen-wakelock-v1.2.19.patch /tmp/screen-wakelock.patch
-          # Patch-flags base + the 5 re-split feature patches (each ADB-toggleable
-          # via patch_* flags; see freekiosk-patch-flags). Copy them all out before
+          # Patch-flags base + the feature patches (each ADB-toggleable via
+          # patch_* flags; see freekiosk-patch-flags). Copy them all out before
           # the tag checkout so branch dispatches work.
           cp freekiosk-patch-flags-v1.2.19.patch /tmp/patch-flags.patch
-          cp freekiosk-keep-screen-on-v1.2.19.patch /tmp/keep-screen-on.patch
           cp freekiosk-keyboard-fix-v1.2.19.patch /tmp/keyboard-fix.patch
-          cp freekiosk-boot-splash-v1.2.19.patch /tmp/boot-splash.patch
+          cp freekiosk-boot-launch-v1.2.19.patch /tmp/boot-launch.patch
+          cp freekiosk-screen-sleep-v1.2.19.patch /tmp/screen-sleep.patch
           cp freekiosk-refresh-button-v1.2.19.patch /tmp/refresh-button.patch
           cp freekiosk-webview-render-recovery-v1.2.19.patch /tmp/webview-render-recovery.patch
           cp freekiosk-camera-teardown-v1.2.19.patch /tmp/camera-teardown.patch
@@ -85,8 +81,6 @@ jobs:
           # `adb ... --es config '{"patch_<name>":"false"}'`.
           git apply --3way --verbose --whitespace=nowarn /tmp/patch-flags.patch
           git add -A
-          git apply --3way --verbose --whitespace=nowarn /tmp/keep-screen-on.patch
-          git add -A
           # keyboard-fix REPLACES keyboard-gap (same MainActivity region, same
           # sequence slot). keyboard-gap reset its stale padding from the very
           # insets callbacks that Kyocera DuraForce2 / Android 10 never delivers
@@ -96,14 +90,33 @@ jobs:
           # while keyboard padding is applied. ADB-toggleable: patch_keyboard_fix.
           git apply --3way --verbose --whitespace=nowarn /tmp/keyboard-fix.patch
           git add -A
-          git apply --3way --verbose --whitespace=nowarn /tmp/boot-splash.patch
+          # boot-launch REPLACES boot-splash (same relaxed non-DO gate, same
+          # patch_boot_splash flag) and adds the missing reliability layer:
+          # Android 10 silently discards the receiver's startActivity at boot
+          # (background-activity-launch restriction) unless an exemption applies,
+          # which is why the splash only appeared "sometimes" — and always after
+          # a PIN unlock, where launches queue behind the keyguard. The receiver
+          # keeps exactly ONE non-blocking attempt (no retry loops in receiver
+          # context); the retry engine lives in KioskWatchdogService (START_STICKY
+          # FGS, own handler): an accelerated boot phase retries every ~1.8s up to
+          # 5x with positive confirmation via BootLockActivity.running, then hands
+          # over to the normal 10s loop. MainActivity also refreshes the
+          # device-encrypted fast-boot flag on every start so the FIRST reboot
+          # after enabling kiosk already takes the instant LOCKED_BOOT path.
+          # For fully deterministic boot launch, additionally grant FreeKiosk
+          # "Display over other apps" (SYSTEM_ALERT_WINDOW) — a documented BAL
+          # exemption.
+          git apply --3way --verbose --whitespace=nowarn /tmp/boot-launch.patch
           git add -A
-          # screen-wakelock LAST — neutralizes the page's navigator.wakeLock when
-          # Keep Screen On is off. Regenerated as standalone after force-text and
-          # gboard were dropped from this build: its WebViewComponent.tsx hunk no
-          # longer piggybacks on force-text's KioskModule import / getPatchFlags
-          # effect, so it applies cleanly on its own.
-          git apply --3way --verbose --whitespace=nowarn /tmp/screen-wakelock.patch
+          # screen-sleep REPLACES keep-screen-on + screen-wakelock as their exact
+          # union (verified byte-identical content, flags patch_keep_screen_on and
+          # patch_wakelock preserved). The two are disjoint halves of one feature:
+          # the conditional FLAG_KEEP_SCREEN_ON covers FreeKiosk's own window flag;
+          # the wake-lock neutralizer covers the page's navigator.wakeLock, which
+          # Chromium honors independently of any window flag. The document-start
+          # wake gate that closes the load-time acquisition race lives in
+          # webview-resilience (single owner of injectedJavaScriptBeforeContentLoaded).
+          git apply --3way --verbose --whitespace=nowarn /tmp/screen-sleep.patch
           git add -A
           # webview-render-recovery — backport of upstream commit 9ffdc7b (#198),
           # which landed after v1.2.19: when the Chromium renderer process dies
@@ -130,7 +143,7 @@ jobs:
           # patches above; diffed against the post-recovery tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/camera-teardown.patch
           git add -A
-          # webview-resilience — two WebViewComponent-only changes:
+          # webview-resilience — WebViewComponent-only changes:
           # (1) getUserMedia wrapper (document-start): 8s no-settle watchdog +
           #     one transparent 1.2s retry for the retryable error class,
           #     absorbing the Kyocera legacy-HAL cold-start race that camera
@@ -139,12 +152,19 @@ jobs:
           # (2) the PDF-link MutationObserver is debounced (500ms) — it used to
           #     rescan every anchor on every DOM mutation, visibly delaying tap
           #     handling on heavy SPA pages (1000+ card lists) on slow CPUs.
+          # (3) document-start wake-lock gate (composed with the camera wrapper —
+          #     this patch is the single owner of injectedJavaScriptBeforeContentLoaded):
+          #     brokers navigator.wakeLock.request before any page script runs, so
+          #     a Screen Wake Lock the page acquires DURING load can be released
+          #     when Keep Screen On is off. screen-sleep's neutralize/restore
+          #     scripts flip the gate live; without this patch they fall back to
+          #     the legacy stub-swap.
           # Applied last; diffed against the post-camera-teardown tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/webview-resilience.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 57/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.34"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 58/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.35"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
