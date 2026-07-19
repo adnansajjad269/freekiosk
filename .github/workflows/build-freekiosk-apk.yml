@@ -159,12 +159,22 @@ jobs:
           #     when Keep Screen On is off. screen-sleep's neutralize/restore
           #     scripts flip the gate live; without this patch they fall back to
           #     the legacy stub-swap.
+          # (4) camera wrapper v2: on a retryable failure of a video request, stop
+          #     stale live video tracks the page hasn't released (registry in
+          #     window.__fkLiveCamStreams) before the retry — fixes the
+          #     deterministic first-fail on camera SWITCH on the Kyocera HAL;
+          #     retryable set broadened to include OverconstrainedError/NotFoundError.
+          # (5) [FreeKioskNet] fetch+XHR instrumentation (log-only, query strings
+          #     stripped): names endpoints that hang/fail for the reboot-immune
+          #     infinite-spinner / partial-load reports.
+          # (6) triple-press the refresh button within 2s → clearCache(true)+reload
+          #     (operator self-service recovery; single press unchanged).
           # Applied last; diffed against the post-camera-teardown tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/webview-resilience.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 58/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.35"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 59/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.36"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"

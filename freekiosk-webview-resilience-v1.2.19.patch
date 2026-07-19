@@ -1,5 +1,5 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..cc450f7 100644
+index 6be3b4f..af0aa69 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -82,7 +82,7 @@ index 6be3b4f..cc450f7 100644
        navigator.wakeLock.request = window.__fkWakeOrig;
      }
    } catch(e){}
-@@ -76,26 +99,123 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -76,26 +99,165 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -173,7 +173,7 @@ index 6be3b4f..cc450f7 100644
 +    navigator.mediaDevices.__fkCamWrap = true;
      var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 -    navigator.mediaDevices.getUserMedia = function(constraints){
-+    var RETRYABLE = { NotReadableError: 1, TrackStartError: 1, AbortError: 1 };
++    var RETRYABLE = { NotReadableError: 1, TrackStartError: 1, AbortError: 1, OverconstrainedError: 1, NotFoundError: 1 };
 +    function attempt(constraints, tag){
        var t0 = Date.now();
 -      try { console.log('[FreeKioskCam] getUserMedia start ' + JSON.stringify(constraints)); } catch(e) {}
@@ -200,6 +200,16 @@ index 6be3b4f..cc450f7 100644
 +          }
 +          settled = true; clearTimeout(timer);
 +          console.log('[FreeKioskCam] ' + tag + ' OK in ' + (Date.now()-t0) + 'ms');
++          // #camera-switch: track live video streams so a later switch can stop a
++          // stale one that the page has not released yet (see the retry path).
++          try {
++            if (stream.getVideoTracks && stream.getVideoTracks().length) {
++              window.__fkLiveCamStreams = (window.__fkLiveCamStreams || []).filter(function(s){
++                return s.getTracks && s.getTracks().some(function(t){ return t.readyState === 'live'; });
++              });
++              window.__fkLiveCamStreams.push(stream);
++            }
++          } catch(e) {}
 +          resolve(stream);
 +        }, function(err){
 +          if (settled) return;
@@ -209,19 +219,154 @@ index 6be3b4f..cc450f7 100644
 +        });
 +      });
 +    }
++    function wantsVideo(constraints){
++      return !!(constraints && constraints.video);
++    }
++    function stopStaleVideoTracks(){
++      // #camera-switch: the deterministic first-fail on camera SWITCH is the page
++      // requesting camera B while camera A's track is still live — the legacy HAL
++      // cannot open B while A is held, and the page only releases A in its own
++      // error handler (which is why the operator's manual "Try again" works). We
++      // do that release programmatically before the retry: stop every other live
++      // video track. Safe because this is a single-camera scanner — a new video
++      // request supersedes the previous stream by definition, and we only reach
++      // here after a failure, on the retry path.
++      var stopped = 0;
++      var streams = window.__fkLiveCamStreams || [];
++      streams.forEach(function(s){
++        try {
++          (s.getVideoTracks ? s.getVideoTracks() : []).forEach(function(t){
++            if (t.readyState === 'live') { t.stop(); stopped++; }
++          });
++        } catch(e) {}
++      });
++      window.__fkLiveCamStreams = [];
++      return stopped;
++    }
 +    navigator.mediaDevices.getUserMedia = function(constraints){
 +      try { console.log('[FreeKioskCam] getUserMedia ' + JSON.stringify(constraints)); } catch(e) {}
 +      return attempt(constraints, 'attempt#1').catch(function(err){
 +        var name = err && err.name;
 +        if (!RETRYABLE[name]) throw err;
-+        console.log('[FreeKioskCam] retrying once in 1200ms (' + name + ')');
-+        return new Promise(function(r){ setTimeout(r, 1200); }).then(function(){
++        var waitMs = 1200;
++        if (wantsVideo(constraints)) {
++          var n = stopStaleVideoTracks();
++          if (n > 0) {
++            console.log('[FreeKioskCam] stopping ' + n + ' stale video track(s) before retry');
++            waitMs = 1500; // give the HAL time to fully close the previous camera
++          }
++        }
++        console.log('[FreeKioskCam] retrying once in ' + waitMs + 'ms (' + name + ')');
++        return new Promise(function(r){ setTimeout(r, waitMs); }).then(function(){
 +          return attempt(constraints, 'attempt#2');
 +        });
        });
      };
    } catch(e){}
-@@ -616,9 +736,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -103,6 +265,90 @@ const CAMERA_DIAG_JS = `
+ true;
+ `;
+ 
++// #webview-resilience: [FreeKioskNet] request instrumentation (document-start,
++// log-only). Wraps window.fetch AND XMLHttpRequest (axios uses XHR) to log
++// method + URL path (query strings stripped so tokens never reach logs),
++// status, and duration, plus a "still pending after 15s" marker for hangs. This
++// is the evidence layer for the reboot-immune infinite-spinner / partial-load
++// reports: adb logcat | grep FreeKioskNet names the exact endpoint(s) that hang
++// or fail, distinguishing a backend/network problem from WebView-persisted
++// state. No retries, no behavior change.
++const NET_DIAG_JS = `
++(function(){
++  try {
++    if (window.__fkNetDiag) return;
++    window.__fkNetDiag = true;
++    function fkPath(u){
++      try {
++        if (!u) return '(none)';
++        if (typeof u !== 'string') { u = (u && u.url) ? u.url : String(u); }
++        var s = u.split('#')[0].split('?')[0];
++        var i = s.indexOf('://');
++        if (i >= 0) {
++          var rest = s.substring(i + 3);
++          var slash = rest.indexOf('/');
++          return slash >= 0 ? rest.substring(slash) : '/';
++        }
++        return s;
++      } catch(e){ return '(path?)'; }
++    }
++    function fkWatch(tag, method, path){
++      var t0 = Date.now();
++      var pend = setTimeout(function(){
++        console.log('[FreeKioskNet] ' + tag + ' ' + method + ' ' + path + ' still pending after 15s');
++      }, 15000);
++      return {
++        done: function(status){
++          clearTimeout(pend);
++          console.log('[FreeKioskNet] ' + tag + ' ' + method + ' ' + path + ' -> ' + status + ' in ' + (Date.now()-t0) + 'ms');
++        },
++        fail: function(err){
++          clearTimeout(pend);
++          console.log('[FreeKioskNet] ' + tag + ' ' + method + ' ' + path + ' FAILED in ' + (Date.now()-t0) + 'ms: ' + (err && (err.name + ' - ' + err.message)));
++        }
++      };
++    }
++    if (window.fetch) {
++      var origFetch = window.fetch.bind(window);
++      window.fetch = function(input, init){
++        var method = (init && init.method) || (input && input.method) || 'GET';
++        var w = fkWatch('fetch', method, fkPath(input));
++        return origFetch(input, init).then(function(res){
++          w.done(res && res.status);
++          return res;
++        }, function(err){
++          w.fail(err);
++          throw err;
++        });
++      };
++    }
++    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype) {
++      var XP = window.XMLHttpRequest.prototype;
++      var origOpen = XP.open;
++      var origSend = XP.send;
++      XP.open = function(method, url){
++        this.__fkMethod = method || 'GET';
++        this.__fkPath = fkPath(url);
++        return origOpen.apply(this, arguments);
++      };
++      XP.send = function(){
++        var xhr = this;
++        var w = fkWatch('xhr', xhr.__fkMethod || 'GET', xhr.__fkPath || '(none)');
++        var settled = false;
++        xhr.addEventListener('loadend', function(){
++          if (settled) return; settled = true;
++          if (xhr.status === 0) { w.fail({ name: 'NetworkError', message: 'status 0 (abort/timeout/blocked)' }); }
++          else { w.done(xhr.status); }
++        });
++        return origSend.apply(this, arguments);
++      };
++    }
++  } catch(e){}
++})();
++true;
++`;
++
++
+ interface WebViewComponentProps {
+   url: string;
+   autoReload: boolean;
+@@ -175,6 +421,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   }, []);
+   const blockedUrlTimerRef = useRef<any>(null);
+   const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
++  // #webview-resilience: triple-press the refresh button within 2s to escalate
++  // from a normal reload to a cache-cleared hard reload — an operator self-service
++  // recovery for the reboot-immune stuck/partial-load states, without wiping
++  // localStorage (auth survives). A single press is unchanged.
++  const refreshPressTimesRef = useRef<number[]>([]);
+   const fadeAnim = useRef(new Animated.Value(0)).current;
+   const loadingTimeoutRef = useRef<any>(null);
+ 
+@@ -616,9 +867,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -247,12 +392,47 @@ index 6be3b4f..cc450f7 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -980,7 +1114,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -821,6 +1086,25 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+     }
+   };
+ 
++  const handleRefreshPress = (): void => {
++    const now = Date.now();
++    const times = refreshPressTimesRef.current.filter(function(t){ return now - t < 2000; });
++    times.push(now);
++    refreshPressTimesRef.current = times;
++    if (times.length >= 3) {
++      refreshPressTimesRef.current = [];
++      console.warn('[FreeKiosk] triple-press refresh — cache-cleared hard reload');
++      try {
++        webViewRef.current?.clearCache?.(true);
++      } catch (e) {
++        // clearCache may be unavailable on some RNW builds — reload still runs.
++      }
++      webViewRef.current?.reload();
++    } else {
++      webViewRef.current?.reload();
++    }
++  };
++
+   const handleReload = (): void => {
+     setError(false);
+     setLoading(true);
+@@ -980,7 +1264,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
-+        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS}
++        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS}
  
          javaScriptEnabled={true}
          domStorageEnabled={true}
+@@ -1226,7 +1510,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+           which is unreliable on non-scrolling / inner-scroll SPA pages. */}
+       <TouchableOpacity
+         style={styles.refreshButton}
+-        onPress={() => webViewRef.current?.reload()}
++        onPress={handleRefreshPress}
+         activeOpacity={0.6}
+         hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+       >
