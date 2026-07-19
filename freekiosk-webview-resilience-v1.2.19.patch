@@ -1,5 +1,5 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..3f7ce05 100644
+index 6be3b4f..4789925 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -82,7 +82,7 @@ index 6be3b4f..3f7ce05 100644
        navigator.wakeLock.request = window.__fkWakeOrig;
      }
    } catch(e){}
-@@ -76,33 +99,311 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -76,33 +99,312 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -171,6 +171,7 @@ index 6be3b4f..3f7ce05 100644
 -    navigator.mediaDevices.__fkCamDiag = true;
 +    if (navigator.mediaDevices.__fkCamWrap) return;
 +    navigator.mediaDevices.__fkCamWrap = true;
++    try { console.log('[FreeKioskCam] wrapper installed (' + (window.top === window ? 'main-frame' : 'sub-frame') + ')'); } catch(e){}
      var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 -    navigator.mediaDevices.getUserMedia = function(constraints){
 +    // HAL-lockout trifecta ONLY. OverconstrainedError / NotFoundError are
@@ -409,7 +410,7 @@ index 6be3b4f..3f7ce05 100644
  interface WebViewComponentProps {
    url: string;
    autoReload: boolean;
-@@ -175,6 +476,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -175,6 +477,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
    }, []);
    const blockedUrlTimerRef = useRef<any>(null);
    const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
@@ -421,7 +422,7 @@ index 6be3b4f..3f7ce05 100644
    const fadeAnim = useRef(new Animated.Value(0)).current;
    const loadingTimeoutRef = useRef<any>(null);
  
-@@ -616,9 +922,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -616,9 +923,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -447,7 +448,7 @@ index 6be3b4f..3f7ce05 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -821,6 +1141,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -821,6 +1142,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      }
    };
  
@@ -483,16 +484,21 @@ index 6be3b4f..3f7ce05 100644
    const handleReload = (): void => {
      setError(false);
      setLoading(true);
-@@ -980,7 +1329,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,7 +1330,12 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
 +        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS}
++        // #camera-switch: inject the document-start wrappers into EVERY frame, not
++        // just the main document. If LAAM's barcode scanner runs inside an iframe,
++        // a main-frame-only wrapper never intercepts its getUserMedia — which is
++        // why the camera retry never fired (no [FreeKioskCam] logs on switch).
++        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
  
          javaScriptEnabled={true}
          domStorageEnabled={true}
-@@ -1226,7 +1575,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -1226,7 +1581,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            which is unreliable on non-scrolling / inner-scroll SPA pages. */}
        <TouchableOpacity
          style={styles.refreshButton}
