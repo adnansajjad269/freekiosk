@@ -1,5 +1,5 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..4789925 100644
+index 6be3b4f..05c4a6d 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -448,7 +448,46 @@ index 6be3b4f..4789925 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -821,6 +1142,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -708,7 +1029,37 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+     wv.injectJavaScript(wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
+   }, [wakeLockActive]);
+ 
+-  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript() + getWakeLockOverrideScript();
++  // #iteration8: react-native-webview's injectedJavaScriptBeforeContentLoaded is
++  // documented as unreliable on Android (some report it firing on only a small
++  // percentage of page loads — RNW issue #1609/#3377), and its ...ForMainFrameOnly
++  // flag has NO effect on Android regardless of value (RNW only injects into the
++  // main frame there, full stop). The entire camera/wake-lock/net wrapper stack
++  // rode exclusively on that one prop, which would explain zero effect and zero
++  // [FreeKioskCam] logs even with no iframe involved. getInstallWrappersScript()
++  // installs the same wrappers again here, on the OLD, proven-reliable
++  // onPageFinished-based injectedJavaScript path already used in production by
++  // the keyboard force_numeric/smart scripts and PDF-link interception. Every
++  // wrapper below is self-guarded (__fkCamWrap / __fkNetDiag / navigator.__fkWakeGate)
++  // so firing from both injection points is harmless — whichever one actually
++  // runs (or both) installs exactly once. injectedJavaScriptBeforeContentLoaded
++  // stays wired too, for the earliest possible coverage on loads where it does fire.
++  const getInstallWrappersScript = (): string => `
++    (function(){
++      try {
++        console.log('[FreeKioskCam] onPageFinished-path check: frame=' +
++          (window.top === window ? 'main' : 'sub') +
++          ', iframeCount=' + document.querySelectorAll('iframe').length +
++          ', alreadyWrapped=' + !!(navigator.mediaDevices && navigator.mediaDevices.__fkCamWrap));
++        var ifr = document.querySelectorAll('iframe');
++        for (var i = 0; i < ifr.length; i++) {
++          try { console.log('[FreeKioskCam] iframe[' + i + '] src=' + (ifr[i].src || '(none)')); } catch(e){}
++        }
++      } catch(e){}
++    })();
++    true;
++  ` + buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS;
++
++  const combinedInjectedJavaScript = injectedJavaScript + getKeyboardModeScript() + getWakeLockOverrideScript() + getInstallWrappersScript();
+ 
+   // Gestion des messages venant de la webview
+   const onMessageHandler = (event: any) => {
+@@ -821,6 +1172,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      }
    };
  
@@ -484,21 +523,17 @@ index 6be3b4f..4789925 100644
    const handleReload = (): void => {
      setError(false);
      setLoading(true);
-@@ -980,7 +1330,12 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,8 +1360,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
+-
 +        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS}
-+        // #camera-switch: inject the document-start wrappers into EVERY frame, not
-+        // just the main document. If LAAM's barcode scanner runs inside an iframe,
-+        // a main-frame-only wrapper never intercepts its getUserMedia — which is
-+        // why the camera retry never fired (no [FreeKioskCam] logs on switch).
-+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
- 
          javaScriptEnabled={true}
          domStorageEnabled={true}
-@@ -1226,7 +1581,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+         injectedJavaScript={combinedInjectedJavaScript}
+@@ -1226,7 +1605,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            which is unreliable on non-scrolling / inner-scroll SPA pages. */}
        <TouchableOpacity
          style={styles.refreshButton}

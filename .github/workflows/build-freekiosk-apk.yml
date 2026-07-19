@@ -113,9 +113,9 @@ jobs:
           # patch_wakelock preserved). The two are disjoint halves of one feature:
           # the conditional FLAG_KEEP_SCREEN_ON covers FreeKiosk's own window flag;
           # the wake-lock neutralizer covers the page's navigator.wakeLock, which
-          # Chromium honors independently of any window flag. The document-start
-          # wake gate that closes the load-time acquisition race lives in
-          # webview-resilience (single owner of injectedJavaScriptBeforeContentLoaded).
+          # Chromium honors independently of any window flag. The wake gate that
+          # closes the load-time acquisition race lives in webview-resilience,
+          # installed via both its injection paths (see that step's comment).
           git apply --3way --verbose --whitespace=nowarn /tmp/screen-sleep.patch
           git add -A
           # webview-render-recovery — backport of upstream commit 9ffdc7b (#198),
@@ -173,12 +173,25 @@ jobs:
           #     infinite-spinner / partial-load reports.
           # (6) triple-press the refresh button within 2s → clearCache(true)+reload
           #     (operator self-service recovery; single press unchanged).
+          # (7) iteration8: injectedJavaScriptBeforeContentLoaded is documented as
+          #     unreliable on Android (RNW issues #1609/#3377) and its
+          #     ...ForMainFrameOnly flag has NO effect there (Android only ever
+          #     injects into the main frame via that prop) — so 1.2.39's all-frames
+          #     attempt was a no-op, and the whole camera/wake/net wrapper stack may
+          #     simply never have installed. The wrappers are now ALSO composed into
+          #     combinedInjectedJavaScript (the older, proven-reliable
+          #     onPageFinished-based injectedJavaScript prop, already used in
+          #     production by the keyboard force_numeric/smart scripts and PDF-link
+          #     interception) as a guaranteed backstop — every wrapper is
+          #     self-guarded so double-install from both paths is harmless. A new
+          #     always-fires diagnostic logs frame identity + iframe count, settling
+          #     the iframe question with evidence instead of another guess.
           # Applied last; diffed against the post-camera-teardown tree.
           git apply --3way --verbose --whitespace=nowarn /tmp/webview-resilience.patch
           git add -A
           # Bump versionCode so this build installs over the previous test build
-          sed -E -i 's/versionCode [0-9]+/versionCode 62/' android/app/build.gradle
-          sed -E -i 's/versionName "[^"]+"/versionName "1.2.39"/' android/app/build.gradle
+          sed -E -i 's/versionCode [0-9]+/versionCode 63/' android/app/build.gradle
+          sed -E -i 's/versionName "[^"]+"/versionName "1.2.40"/' android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
           grep versionCode android/app/build.gradle
           echo "Patch applied cleanly on top of ${{ github.event.inputs.source_tag }}"
