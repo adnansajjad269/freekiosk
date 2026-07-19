@@ -75,10 +75,10 @@ index e7d624d..7634830 100644
                  context.startForegroundService(serviceIntent)
              } else {
 diff --git a/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt b/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
-index 8739174..f2fa626 100644
+index 8739174..f8940b9 100644
 --- a/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
 +++ b/android/app/src/main/java/com/freekiosk/KioskWatchdogService.kt
-@@ -39,11 +39,57 @@ class KioskWatchdogService : Service() {
+@@ -39,11 +39,86 @@ class KioskWatchdogService : Service() {
          private const val NOTIFICATION_ID = 2002
          private const val CHECK_INTERVAL_MS = 10_000L  // check every 10 s
          private const val RELAUNCH_COOLDOWN_MS = 15_000L // min 15 s between relaunches
@@ -94,8 +94,8 @@ index 8739174..f2fa626 100644
 +        // normal 10s loop. This service is a START_STICKY foreground service:
 +        // retries run on its own handler, never in the receiver.
 +        const val EXTRA_BOOT_LAUNCH = "boot_launch"
-+        private const val BOOT_PHASE_INTERVAL_MS = 1_800L
-+        private const val BOOT_PHASE_MAX_ATTEMPTS = 5
++        private const val BOOT_PHASE_INTERVAL_MS = 2_000L
++        private const val BOOT_PHASE_MAX_ATTEMPTS = 12   // ~24s window (covers busy long-idle boots)
      }
  
      private val handler = Handler(Looper.getMainLooper())
@@ -107,36 +107,65 @@ index 8739174..f2fa626 100644
 +    private val bootPhaseRunnable = object : Runnable {
 +        override fun run() {
 +            if (!isRunning || !bootPhaseActive) return
-+            if (BootLockActivity.running || isMainActivityRunning()) {
-+                DebugLog.d(TAG, "Boot phase: FreeKiosk is up (after $bootPhaseAttempts retries)")
-+                bootPhaseActive = false
-+                return
-+            }
 +            if (!isKioskEnabled()) {
 +                bootPhaseActive = false
 +                return
 +            }
 +            bootPhaseAttempts += 1
-+            DebugLog.errorProduction(TAG, "boot launch attempt #$bootPhaseAttempts silently blocked (background-activity-launch restriction) — retrying")
-+            try {
-+                val intent = Intent(this@KioskWatchdogService, BootLockActivity::class.java)
-+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-+                startActivity(intent)
-+            } catch (e: Exception) {
-+                DebugLog.errorProduction(TAG, "Boot phase launch failed: ${e.message}")
-+            }
++            // #boot-launch reclaim: on a long-idle boot the system fires transient
++            // activities/notifications (a missed clock alarm, "no SIM") that briefly
++            // steal the foreground from FreeKiosk — the "FreeKiosk appears 5-10s
++            // after the launcher" case. Android 10 forbids a non-privileged app from
++            // even detecting another app's foreground, so rather than detect-and-stop
++            // we simply re-assert FreeKiosk's own task to the front on every tick for
++            // the whole boot window. bringFreeKioskToFront() is a no-op when we are
++            // already on top (AppTask.moveToFront via the declared REORDER_TASKS), so
++            // a clean quick-reboot is visually unaffected. NOTE: for the re-assert to
++            // win at all, FreeKiosk must hold SYSTEM_ALERT_WINDOW — without it these
++            // foreground moves are background-activity-launch-restricted and dropped.
++            bringFreeKioskToFront()
 +            if (bootPhaseAttempts < BOOT_PHASE_MAX_ATTEMPTS) {
 +                handler.postDelayed(this, BOOT_PHASE_INTERVAL_MS)
 +            } else {
-+                DebugLog.errorProduction(TAG, "Boot phase exhausted after $BOOT_PHASE_MAX_ATTEMPTS attempts — normal watchdog loop takes over. For deterministic boot launch, grant FreeKiosk the 'Display over other apps' permission (SYSTEM_ALERT_WINDOW).")
++                DebugLog.d(TAG, "Boot phase complete after $bootPhaseAttempts re-assert(s). If FreeKiosk still lags at boot, grant it 'Display over other apps' (SYSTEM_ALERT_WINDOW).")
 +                bootPhaseActive = false
 +            }
 +        }
 +    }
++
++    /**
++     * Bring FreeKiosk's own task to the foreground, reclaiming the screen from a
++     * transient boot-time system dialog. AppTask.moveToFront() (backed by the
++     * declared REORDER_TASKS permission) acts only on our own task and is a no-op
++     * when we are already frontmost — so this is safe to call unconditionally
++     * during the boot window. If no FreeKiosk task exists yet (the receiver's
++     * launch was BAL-dropped), fall back to starting the instant boot splash.
++     */
++    private fun bringFreeKioskToFront() {
++        try {
++            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++            val ownTask = am.appTasks.firstOrNull { t ->
++                try { t.taskInfo.topActivity?.packageName == packageName } catch (e: Exception) { false }
++            }
++            if (ownTask != null) {
++                ownTask.moveToFront()
++            } else {
++                startActivity(Intent(this, BootLockActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++            }
++        } catch (e: Exception) {
++            DebugLog.d(TAG, "bringFreeKioskToFront failed: ${e.message}")
++        }
++    }
++
++    private fun isDeviceSecure(): Boolean {
++        return try {
++            (getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isDeviceSecure
++        } catch (e: Exception) { false }
++    }
  
      private val checkRunnable = object : Runnable {
          override fun run() {
-@@ -77,6 +123,17 @@ class KioskWatchdogService : Service() {
+@@ -77,6 +152,23 @@ class KioskWatchdogService : Service() {
          handler.removeCallbacks(checkRunnable)
          handler.postDelayed(checkRunnable, CHECK_INTERVAL_MS)
  
@@ -145,10 +174,16 @@ index 8739174..f2fa626 100644
 +        val bootPatchOn = getSharedPreferences("FreeKioskSettings", Context.MODE_PRIVATE)
 +            .getBoolean("patch_boot_splash_enabled", true)
 +        if (bootPatchOn && intent?.getBooleanExtra(EXTRA_BOOT_LAUNCH, false) == true && !bootPhaseActive) {
-+            bootPhaseActive = true
-+            bootPhaseAttempts = 0
-+            handler.postDelayed(bootPhaseRunnable, BOOT_PHASE_INTERVAL_MS)
-+            DebugLog.d(TAG, "Boot-launch phase armed (first check in ${BOOT_PHASE_INTERVAL_MS}ms)")
++            if (isDeviceSecure()) {
++                // A secure keyguard owns boot; FreeKiosk starts cleanly after unlock
++                // (user-confirmed working). Don't fight the keyguard with moveToFront.
++                DebugLog.d(TAG, "Boot phase skipped — device secure; keyguard owns boot")
++            } else {
++                bootPhaseActive = true
++                bootPhaseAttempts = 0
++                handler.postDelayed(bootPhaseRunnable, BOOT_PHASE_INTERVAL_MS)
++                DebugLog.d(TAG, "Boot-launch reclaim armed (re-assert every ${BOOT_PHASE_INTERVAL_MS}ms x $BOOT_PHASE_MAX_ATTEMPTS)")
++            }
 +        }
 +
          DebugLog.d(TAG, "Watchdog started (START_STICKY)")
