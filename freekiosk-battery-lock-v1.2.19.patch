@@ -82,10 +82,10 @@ index 9ceb0c5..b4a722c 100644
  +        // isMainFrameRequest() handles: null topWindowUrl (initial nav), exact match, and
 diff --git a/src/components/BatteryLockOverlay.tsx b/src/components/BatteryLockOverlay.tsx
 new file mode 100644
-index 0000000..92000d1
+index 0000000..a937e95
 --- /dev/null
 +++ b/src/components/BatteryLockOverlay.tsx
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,302 @@
 +/**
 + * BatteryLockOverlay.tsx
 + *
@@ -153,7 +153,7 @@ index 0000000..92000d1
 +  message: string;
 +};
 +
-+const BatteryLockOverlay: React.FC = () => {
++const BatteryLockOverlay: React.FC<{ onFreezeActiveChange?: (active: boolean) => void }> = ({ onFreezeActiveChange }) => {
 +  const [tier, setTier] = useState<'none' | 'warn' | 'freeze'>('none');
 +  const [level, setLevel] = useState<number | null>(null);
 +  const [charging, setCharging] = useState(false);
@@ -163,6 +163,12 @@ index 0000000..92000d1
 +  const freezeArmed = useRef(false);
 +  const lastAckLevel = useRef<number | null>(null); // level at which user last acknowledged
 +  const warnDismissedAt = useRef<number | null>(null);
++  // #battery-power-save: fire onFreezeActiveChange only on the transition into /
++  // out of the freeze tier (via a ref so the always-latest inline callback is
++  // used and the screen-off call happens once per episode, not every 15s poll).
++  const prevFreezeActive = useRef(false);
++  const onFreezeActiveChangeRef = useRef(onFreezeActiveChange);
++  onFreezeActiveChangeRef.current = onFreezeActiveChange;
 +  const settingsRef = useRef<Settings>({
 +    enabled: false, freeze: 5, warn: 20, release: 50, step: 1, message: '',
 +  });
@@ -193,7 +199,7 @@ index 0000000..92000d1
 +    // ---- FREEZE latch ----
 +    if (lvl <= s.freeze) { freezeArmed.current = true; }
 +    if (lvl >= s.release) { freezeArmed.current = false; }
-+    const freezeVisible = freezeArmed.current && !(isCharging && lvl > s.freeze);
++    const freezeVisible = freezeArmed.current && !isCharging;  // #issue1: charger lifts the freeze at once (was: only after climbing back above freeze%)
 +
 +    if (freezeVisible) {
 +      // freeze wins over everything; also clear any warning bookkeeping
@@ -284,6 +290,17 @@ index 0000000..92000d1
 +  // drive the pulse animation from tier
 +  useEffect(() => {
 +    if (tier === 'warn') { startPulse(); } else { stopPulse(); }
++  }, [tier]);
++
++  // #battery-power-save: notify KioskScreen when the freeze tier turns on/off so
++  // it can turn the display fully off and restore it (dominant drain is the LCD
++  // backlight; the freeze used to keep it lit continuously).
++  useEffect(() => {
++    const active = tier === 'freeze';
++    if (active !== prevFreezeActive.current) {
++      prevFreezeActive.current = active;
++      onFreezeActiveChangeRef.current?.(active);
++    }
 +  }, [tier]);
 +
 +  const onAcknowledge = () => {
@@ -482,7 +499,7 @@ index 0000000..5e945d2
 +  );
 +};
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index bf878c1..d00f06d 100644
+index bf878c1..8d3c910 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
 @@ -9,6 +9,7 @@ import MediaPlayerComponent from '../components/MediaPlayerComponent';
@@ -493,13 +510,27 @@ index bf878c1..d00f06d 100644
  import { StorageService } from '../utils/storage';
  import { saveSecurePin, saveSecureMqttPassword, getSecureBasicAuthPassword } from '../utils/secureStorage';
  import KioskModule from '../utils/KioskModule';
-@@ -2609,6 +2610,9 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -2609,6 +2610,23 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
            onPress={screenSchedulerWakeOnTouch ? onScreensaverTap : undefined}
          />
        )}
 +
 +      {/* Low-battery warning + freeze overlays (Modal above everything) */}
-+      <BatteryLockOverlay />
++      <BatteryLockOverlay
++        onFreezeActiveChange={(active) => {
++          // #battery-power-save: the freeze must conserve battery, not just draw a
++          // red screen. On freeze, drop keep-screen-on and turn the display fully
++          // off (Device Owner lockNow); restore both when it lifts. (v1.2.19 has no
++          // WebView-pause API, so this targets the dominant drain — the backlight.)
++          if (active) {
++            KioskModule.setKeepScreenOn(false).catch(() => {});
++            KioskModule.turnScreenOff().catch(() => {});
++          } else {
++            KioskModule.setKeepScreenOn(keepScreenOn).catch(() => {});
++            KioskModule.turnScreenOn().catch(() => {});
++          }
++        }}
++      />
      </View>
    );
  };
