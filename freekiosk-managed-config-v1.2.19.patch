@@ -1577,10 +1577,10 @@ index d00f06d..d8c4da5 100644
      // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..270314c
+index 0000000..86272be
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,636 @@
+@@ -0,0 +1,689 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1603,7 +1603,9 @@ index 0000000..270314c
 + *      arrays). The sentinel ["__CLEAR__"] means "set this list to empty".
 + *   3. kiosk_pin is a top-level, ungated, normalized, separately-acked entry —
 + *      applied on every emission regardless of config_version (per-device PIN
-+ *      pushes don't bump the fleet version). See applyPin().
++ *      pushes don't bump the fleet version). See applyPin(). return_tap_count
++ *      is the same: ungated, applied on every emission, acked to its own
++ *      custom slot (3). See applyReturnTapCount().
 + *   4. Object-array fields arrive as arrays of plain objects (native converts
 + *      the launcher's Parcelable[] of Bundles); they are passed straight to the
 + *      setters, which persist them as JSON.
@@ -1837,7 +1839,6 @@ index 0000000..270314c
 +  back_button_timer_delay: { get: StorageService.getBackButtonTimerDelay, set: StorageService.saveBackButtonTimerDelay },
 +  url_rotation_interval: { get: StorageService.getUrlRotationInterval, set: StorageService.saveUrlRotationInterval },
 +  rest_api_port: { get: StorageService.getRestApiPort, set: StorageService.saveRestApiPort },
-+  return_tap_count: { get: StorageService.getReturnTapCount, set: StorageService.saveReturnTapCount },
 +  return_tap_timeout: { get: StorageService.getReturnTapTimeout, set: StorageService.saveReturnTapTimeout },
 +  screensaver_brightness: { get: StorageService.getScreensaverBrightness, set: StorageService.saveScreensaverBrightness },
 +  screensaver_inactivity_delay: { get: StorageService.getScreensaverInactivityDelay, set: StorageService.saveScreensaverInactivityDelay },
@@ -1879,7 +1880,13 @@ index 0000000..270314c
 +
 +// Keys that are legitimate at the top level of the restrictions bundle but are
 +// not settings fields themselves.
-+const RESERVED_KEYS = new Set(['config_version', 'config_fields', 'kiosk_pin', 'kiosk_pin_label']);
++const RESERVED_KEYS = new Set([
++  'config_version',
++  'config_fields',
++  'kiosk_pin',
++  'kiosk_pin_label',
++  'return_tap_count',
++]);
 +
 +const KNOWN_FIELD_KEYS = new Set([
 +  ...Object.keys(BOOL_FIELDS),
@@ -1976,6 +1983,43 @@ index 0000000..270314c
 +    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
 +    `${pad(d.getHours())}:${pad(d.getMinutes())}`
 +  );
++}
++
++/**
++ * return_tap_count — the second top-level, ungated, separately-acked entry
++ * (see applyPin() above). Pushable standalone with no config_version, so an
++ * admin can nudge this one counter without touching the fleet version.
++ * Returns true only if the value was actually changed.
++ */
++export async function applyReturnTapCount(
++  restrictions: Record<string, unknown>,
++  native: ManagedConfigNative | undefined,
++): Promise<boolean> {
++  const raw = restrictions.return_tap_count;
++  if (raw === undefined || raw === null) return false;
++
++  const value = Number(raw);
++  if (!Number.isFinite(value)) {
++    console.warn(`[ManagedConfig] return_tap_count present but not a valid number: ${JSON.stringify(raw)}`);
++    return false;
++  }
++
++  const current = await StorageService.getReturnTapCount();
++  if (current === value) {
++    console.log('[ManagedConfig] return_tap_count present but unchanged; skipping');
++    return false;
++  }
++
++  await StorageService.saveReturnTapCount(value);
++
++  const ackValue = `${value} @ ${formatLocalDateTime(new Date())}`;
++  try {
++    await native?.reportCustom(3, ackValue);
++    console.log(`[ManagedConfig] return_tap_count updated to ${value}, reported ack custom3=${ackValue}`);
++  } catch (e) {
++    console.warn('[ManagedConfig] return_tap_count ack (custom3) failed:', e);
++  }
++  return true;
 +}
 +
 +// ---- bulk apply (version-gated, per-field diffed) --------------------------
@@ -2078,6 +2122,8 @@ index 0000000..270314c
 +export interface ApplyResult {
 +  /** PIN was changed (never triggers a reload). */
 +  pinChanged: boolean;
++  /** return_tap_count was changed (never triggers a reload). */
++  returnTapCountChanged: boolean;
 +  /** At least one bulk field was actually written (triggers a live reload). */
 +  bulkApplied: boolean;
 +}
@@ -2096,7 +2142,7 @@ index 0000000..270314c
 +  restrictions: Record<string, unknown> | null | undefined,
 +  native: ManagedConfigNative | undefined,
 +): Promise<ApplyResult> {
-+  const result: ApplyResult = { pinChanged: false, bulkApplied: false };
++  const result: ApplyResult = { pinChanged: false, returnTapCountChanged: false, bulkApplied: false };
 +  if (!restrictions) {
 +    console.log('[ManagedConfig] no restrictions bundle; nothing to apply');
 +    return result;
@@ -2108,6 +2154,13 @@ index 0000000..270314c
 +    result.pinChanged = await applyPin(restrictions, native);
 +  } catch (e) {
 +    console.warn('[ManagedConfig] applyPin failed:', e);
++  }
++
++  // 1b. return_tap_count — also ungated, every emission (top-level return_tap_count).
++  try {
++    result.returnTapCountChanged = await applyReturnTapCount(restrictions, native);
++  } catch (e) {
++    console.warn('[ManagedConfig] applyReturnTapCount failed:', e);
 +  }
 +
 +  // 2 + 3. Bulk config, gated on config_version — read from the TOP LEVEL of
