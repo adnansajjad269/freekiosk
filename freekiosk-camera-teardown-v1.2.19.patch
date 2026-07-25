@@ -181,7 +181,7 @@ index a295e0f..70e70f2 100644
          style={styles.camera}
          device={device}
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index e6f957d..6be3b4f 100644
+index bff66d8..102bbb3 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -76,6 +76,33 @@ const WAKE_LOCK_RESTORE_JS = `
@@ -227,36 +227,30 @@ index e6f957d..6be3b4f 100644
          javaScriptEnabled={true}
          domStorageEnabled={true}
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index f83680f..e76bd9d 100644
+index 12cdcb7..93a735a 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
-@@ -2548,13 +2548,22 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -2537,7 +2537,22 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
          />
        )}
  
 -      {/* Motion Detector - Active during pre-check OR when screensaver is ON (only if screen is focused) */}
--      <MotionDetector
--        enabled={isFocused && (motionAlwaysOn || (motionEnabled && (isPreCheckingMotion || isScreensaverActive)))}
--        onMotionDetected={onMotionDetected}
--        sensitivity={motionSensitivity}
--        cameraPosition={motionCameraPosition}
--      />
 +      {/* Motion Detector - Active during pre-check OR when screensaver is ON (only if screen is focused).
-+          #camera-teardown: mounted ONLY when the motion feature is enabled. Mounting it
-+          unconditionally ran vision-camera's useCameraDevice() on every launch, which
-+          initialized the native CameraDevicesManager (availability callback + full camera
-+          enumeration) even on kiosks that never use motion detection — a dormant
-+          same-process camera-service hook that can interfere with the WebView's
-+          getUserMedia on legacy HALs (Kyocera DuraForce2). With the feature off, the
-+          app now makes zero camera-service calls. */}
-+      {(motionAlwaysOn || motionEnabled) && (
-+        <MotionDetector
-+          enabled={isFocused && (motionAlwaysOn || (motionEnabled && (isPreCheckingMotion || isScreensaverActive)))}
-+          onMotionDetected={onMotionDetected}
-+          sensitivity={motionSensitivity}
-+          cameraPosition={motionCameraPosition}
-+        />
-+      )}
- 
-       {/* Visual Button - WebView/Media mode only */}
-       {/* In button mode: button always clickable, visibility controlled by opacity */}
++          #camera-teardown reverted (field-confirmed regression): a prior fix mounted this
++          component ONLY when the motion feature is enabled, theorizing that vision-camera's
++          CameraDevicesManager init (useCameraDevice() → availability callback + full camera
++          enumeration) on every launch was a dormant same-process camera-service hook that
++          interferes with the WebView's getUserMedia on legacy HALs (Kyocera DuraForce2). Field
++          testing showed the opposite on this device: with motion detection off (so this
++          component never mounted), the WebView's barcode-scanner camera opened and streamed
++          fine but decode was slow/unreliable (5-6s, sometimes never, vs. instant on Chrome on
++          the same device) — and toggling motion detection ON, with nothing else changed,
++          fixed it immediately. Mounting unconditionally again (as before that fix) restores
++          whatever HAL-level side effect the CameraDevicesManager init has that this device's
++          getUserMedia depends on for fast decode. enabled= still fully gates the actual camera
++          stream/capture — only the mount (and thus useCameraDevice()/useCameraPermission()) is
++          unconditional, so kiosks that never touch motion detection still get no visible
++          camera activity from this component, just the init side effect. */}
+       <MotionDetector
+         enabled={isFocused && (motionAlwaysOn || (motionEnabled && (isPreCheckingMotion || isScreensaverActive)))}
+         onMotionDetected={onMotionDetected}
