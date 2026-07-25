@@ -1472,10 +1472,10 @@ index 0000000..ff12a7c
 +}
 diff --git a/src/hooks/useManagedConfigSync.ts b/src/hooks/useManagedConfigSync.ts
 new file mode 100644
-index 0000000..cf3fe29
+index 0000000..2267cab
 --- /dev/null
 +++ b/src/hooks/useManagedConfigSync.ts
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,76 @@
 +import { useEffect } from 'react';
 +import { NativeModules, NativeEventEmitter } from 'react-native';
 +import { applyManagedConfig, ApplyResult, ManagedConfigNative } from '../utils/applyManagedConfig';
@@ -1515,7 +1515,13 @@ index 0000000..cf3fe29
 +    const emitter = new NativeEventEmitter(ManagedConfig as any);
 +
 +    const handleReload = (result: ApplyResult) => {
-+      if (!result.bulkApplied) return;
++      // bulkApplied: any gated field actually wrote. returnTapCountChanged: unlike
++      // the PIN (read fresh at PIN-entry time, never stale), returnTapCount is
++      // cached in KioskScreen's React state at load time (`useState`) and read from
++      // that cache on every tap — so a successful ungated apply silently wrote the
++      // new value to storage but the running gesture handler kept using the old
++      // cached count until something else happened to reload settings.
++      if (!result.bulkApplied && !result.returnTapCountChanged) return;
 +      kioskScreenActionsRef.current?.reloadSettings();
 +    };
 +
@@ -1547,7 +1553,7 @@ index 0000000..cf3fe29
 +  }, []);
 +}
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index d00f06d..d8c4da5 100644
+index 6a6a3c2..7d1d35e 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
 @@ -29,6 +29,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -1558,7 +1564,7 @@ index d00f06d..d8c4da5 100644
  import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
  
  const { HttpServerModule } = NativeModules;
-@@ -1876,6 +1877,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -1886,6 +1887,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
      }
    };
  
