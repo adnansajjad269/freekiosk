@@ -1,5 +1,5 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..4d79f97 100644
+index 6be3b4f..b86deed 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -82,7 +82,7 @@ index 6be3b4f..4d79f97 100644
        navigator.wakeLock.request = window.__fkWakeOrig;
      }
    } catch(e){}
-@@ -76,33 +99,315 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -76,33 +99,334 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -159,10 +159,12 @@ index 6be3b4f..4d79f97 100644
 +//     (NotReadableError/TrackStartError/AbortError). Anything else — e.g.
 +//     NotAllowedError — surfaces to the page unchanged, and a second failure
 +//     surfaces too, so the page's own "Try again" UI remains the fallback.
-+//  2. Log every call/outcome as [FreeKioskCam] (visible via adb logcat,
-+//     ReactNativeJS tag, once the onConsoleMessage bridge below re-emits
-+//     page-context console output through RN's own console) so field
-+//     failures name their exact error class.
++//  2. Log every call/outcome as [FreeKioskCam] so field failures name their exact
++//     error class. Visibility requires the RNCWebChromeClient.onConsoleMessage
++//     hunk in patches/react-native-webview+13.16.0.patch: upstream discards ALL
++//     page console output in non-debug builds, and FreeKiosk only ships
++//     assembleRelease — so without that patch these lines never leave the
++//     WebView. With it: `adb logcat -s FreeKioskWebConsole`.
 +// If the watchdog fires and the original open later succeeds, the late
 +// stream's tracks are stopped so no live camera is leaked.
 +const CAMERA_RESILIENCE_JS = `
@@ -293,20 +295,35 @@ index 6be3b4f..4d79f97 100644
  true;
  `;
  
-+// #webview-resilience: hard-reset payload for the triple-press refresh. Android
++// #hard-reset: storage-purge payload for the triple-press refresh. Android
 +// WebView clearCache(true) only clears the HTTP cache — it does NOT evict a
 +// Service Worker, Cache Storage, IndexedDB or WebSQL. A rogue/stale SW (the
 +// reboot-immune, ~1h-self-healing spinner signature) intercepts the reload
 +// before it reaches the cleared network layer, so clearCache alone can't fix it.
-+// This unregisters every Service Worker and deletes every Cache Storage bucket,
-+// then reloads — a fresh clean SW re-installs on the next load. Deliberately
-+// leaves IndexedDB/localStorage intact so auth and any offline-queued scans
-+// survive. A spinner-hung page has an idle main thread, so this runs fine.
-+const SW_NUKE_JS = `
++// This unregisters every Service Worker and deletes every Cache Storage bucket.
++// Deliberately leaves IndexedDB/localStorage intact so auth and any
++// offline-queued scans survive — a device reboot doesn't clear them either, and
++// restart-equivalence is the whole goal here.
++//
++// It deliberately does NOT call location.reload(). The previous version did, AND
++// the RN side fired an unconditional reload() 2.5s later; since injectJavaScript
++// is fire-and-forget and essentially never throws, both always ran. The page
++// reloaded within a few hundred ms and was then interrupted mid-boot by the
++// second reload — producing exactly the half-loaded state the triple-press is
++// meant to clear. Instead this acks via postMessage when the purge settles (with
++// its own 1.5s safety ack if a promise hangs), and the RN side then performs a
++// full WebView remount — new native instance and new renderer process, which a
++// reload can never give us.
++const HARD_RESET_PURGE_JS = `
 +(function(){
++  var done = false;
++  var ack = function(){
++    if (done) return; done = true;
++    try {
++      window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'FK_HARD_RESET_DONE' }));
++    } catch(e){}
++  };
 +  try {
-+    var reloaded = false;
-+    var go = function(){ if (reloaded) return; reloaded = true; try { location.reload(); } catch(e){} };
 +    var tasks = [];
 +    if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
 +      tasks.push(navigator.serviceWorker.getRegistrations().then(function(rs){
@@ -318,9 +335,9 @@ index 6be3b4f..4d79f97 100644
 +        return Promise.all((keys||[]).map(function(k){ try { return caches.delete(k); } catch(e){ return null; } }));
 +      }).catch(function(){}));
 +    }
-+    Promise.all(tasks).then(go, go);
-+    setTimeout(go, 1500);
-+  } catch(e){ try { location.reload(); } catch(_){} }
++    Promise.all(tasks).then(ack, ack);
++    setTimeout(ack, 1500);
++  } catch(e){ ack(); }
 +})();
 +true;
 +`;
@@ -332,8 +349,10 @@ index 6be3b4f..4d79f97 100644
 +// is the evidence layer for the reboot-immune infinite-spinner / partial-load
 +// reports: adb logcat | grep FreeKioskNet names the exact endpoint(s) that hang
 +// or fail, distinguishing a backend/network problem from WebView-persisted
-+// state. No retries, no behavior change. Requires the onConsoleMessage bridge
-+// below — page-context console output does not reach logcat on its own.
++// state. No retries, no behavior change. Requires the RNCWebChromeClient
++// .onConsoleMessage hunk in patches/react-native-webview+13.16.0.patch — without
++// it, upstream discards page console output in release builds and these lines
++// never reach logcat.
 +const NET_DIAG_JS = `
 +(function(){
 +  try {
@@ -413,7 +432,23 @@ index 6be3b4f..4d79f97 100644
  interface WebViewComponentProps {
    url: string;
    autoReload: boolean;
-@@ -175,6 +480,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -125,6 +449,7 @@ interface WebViewComponentProps {
+   customUserAgent?: string; // Custom User-Agent string (empty = default modern Chrome UA)
+   basicAuthCredential?: { username: string; password: string };
+   onRenderProcessGone?: (didCrash: boolean) => void; // #198 — renderer process died, ask parent to remount
++  onHardReset?: () => void; // #hard-reset — triple-press purge finished, ask parent to remount the WebView
+ }
+ 
+ export interface WebViewComponentRef {
+@@ -157,6 +482,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+   customUserAgent = '',
+   basicAuthCredential,
+   onRenderProcessGone,
++  onHardReset,
+ }, ref) => {
+   const navigation = useNavigation<NavigationProp>();
+   const webViewRef = useRef<WebView>(null);
+@@ -175,6 +501,14 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
    }, []);
    const blockedUrlTimerRef = useRef<any>(null);
    const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
@@ -422,10 +457,13 @@ index 6be3b4f..4d79f97 100644
 +  // recovery for the reboot-immune stuck/partial-load states, without wiping
 +  // localStorage (auth survives). A single press is unchanged.
 +  const refreshPressTimesRef = useRef<number[]>([]);
++  // #hard-reset: single-shot guard + safety timer for the triple-press remount.
++  const hardResetPendingRef = useRef<boolean>(false);
++  const hardResetTimerRef = useRef<any>(null);
    const fadeAnim = useRef(new Animated.Value(0)).current;
    const loadingTimeoutRef = useRef<any>(null);
  
-@@ -616,9 +926,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -616,9 +950,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -451,7 +489,7 @@ index 6be3b4f..4d79f97 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -708,7 +1032,37 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -708,7 +1056,37 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      wv.injectJavaScript(wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
    }, [wakeLockActive]);
  
@@ -490,10 +528,45 @@ index 6be3b4f..4d79f97 100644
  
    // Gestion des messages venant de la webview
    const onMessageHandler = (event: any) => {
-@@ -821,6 +1175,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -754,6 +1132,10 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+           PrintModule.printWebView(data.title || 'FreeKiosk Print', data.paperSize || 'A4')
+             .then(() => console.log('[WebView] Print job started'))
+             .catch((err: any) => console.error('[WebView] Print failed:', err));
++        } else if (data.type === 'FK_HARD_RESET_DONE') {
++          // #hard-reset: the page finished purging Service Workers + Cache
++          // Storage — safe to tear the WebView down and remount now.
++          completeHardReset();
+         } else if (data.type === 'PDF_VIEWER_CLOSE') {
+           // User closed PDF viewer, go back to previous page
+           if (webViewRef.current) {
+@@ -821,6 +1203,59 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      }
    };
  
++  // #hard-reset: run the remount exactly once per triple-press, whichever comes
++  // first — the page's FK_HARD_RESET_DONE ack, or the safety timer if the page JS
++  // is wedged and never acks. Falls back to a plain reload when the parent didn't
++  // wire onHardReset (WebViewComponent is used outside KioskScreen too).
++  // Don't let a pending safety timer fire into an unmounted component.
++  React.useEffect(() => () => {
++    if (hardResetTimerRef.current) clearTimeout(hardResetTimerRef.current);
++  }, []);
++
++  const completeHardReset = useCallback((): void => {
++    if (!hardResetPendingRef.current) return;
++    hardResetPendingRef.current = false;
++    if (hardResetTimerRef.current) {
++      clearTimeout(hardResetTimerRef.current);
++      hardResetTimerRef.current = null;
++    }
++    if (onHardReset) {
++      console.warn('[FreeKiosk] hard reset — purge complete, remounting WebView');
++      onHardReset();
++    } else {
++      webViewRef.current?.reload();
++    }
++  }, [onHardReset]);
++
 +  const handleRefreshPress = (): void => {
 +    const now = Date.now();
 +    const times = refreshPressTimesRef.current.filter(function(t){ return now - t < 2000; });
@@ -501,23 +574,23 @@ index 6be3b4f..4d79f97 100644
 +    refreshPressTimesRef.current = times;
 +    if (times.length >= 3) {
 +      refreshPressTimesRef.current = [];
-+      console.warn('[FreeKiosk] triple-press — hard reset (clearCache + SW/Cache-Storage nuke)');
++      console.warn('[FreeKiosk] triple-press — hard reset (clearCache + SW/Cache-Storage purge + remount)');
 +      try {
 +        webViewRef.current?.clearCache?.(true); // HTTP layer
 +      } catch (e) {
-+        // clearCache may be unavailable on some RNW builds — the nuke still runs.
++        // clearCache may be unavailable on some RNW builds — the purge still runs.
 +      }
-+      // SW_NUKE_JS unregisters Service Workers + deletes Cache Storage, then
-+      // reloads (with its own 1.5s safety timeout). Belt-and-suspenders: if the
-+      // page JS engine is truly wedged and never runs the injection, force a
-+      // reload from the RN side after 2.5s.
++      // Arm BEFORE injecting so an ack that lands immediately can't be missed.
++      hardResetPendingRef.current = true;
++      if (hardResetTimerRef.current) clearTimeout(hardResetTimerRef.current);
++      hardResetTimerRef.current = setTimeout(() => completeHardReset(), 2500);
 +      try {
-+        webViewRef.current?.injectJavaScript(SW_NUKE_JS);
++        webViewRef.current?.injectJavaScript(HARD_RESET_PURGE_JS);
 +      } catch (e) {
-+        webViewRef.current?.reload();
-+        return;
++        // Injection itself failed — remount now rather than waiting for an ack
++        // that can never arrive.
++        completeHardReset();
 +      }
-+      setTimeout(() => { try { webViewRef.current?.reload(); } catch (e) {} }, 2500);
 +    } else {
 +      webViewRef.current?.reload();
 +    }
@@ -526,26 +599,17 @@ index 6be3b4f..4d79f97 100644
    const handleReload = (): void => {
      setError(false);
      setLoading(true);
-@@ -980,8 +1363,16 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,8 +1415,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
 -
-+        onConsoleMessage={({ nativeEvent }) => {
-+          // #webview-resilience: react-native-webview's WebChromeClient swallows
-+          // page-context console output — it never reaches adb logcat on its own,
-+          // regardless of tag. Re-emit through RN's own console so the
-+          // [FreeKioskCam]/[FreeKioskNet] diagnostic logs (which assume this path
-+          // already existed) are actually observable via `adb logcat | grep
-+          // FreeKioskCam` (tag ReactNativeJS), in dev and release builds alike.
-+          console.log('[FKWebViewConsole/' + nativeEvent.level + '] ' + nativeEvent.message);
-+        }}
 +        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS}
          javaScriptEnabled={true}
          domStorageEnabled={true}
          injectedJavaScript={combinedInjectedJavaScript}
-@@ -1226,7 +1617,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -1226,7 +1660,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            which is unreliable on non-scrolling / inner-scroll SPA pages. */}
        <TouchableOpacity
          style={styles.refreshButton}
@@ -554,3 +618,93 @@ index 6be3b4f..4d79f97 100644
          activeOpacity={0.6}
          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
        >
+diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
+index 4545322..6a6a3c2 100644
+--- a/src/screens/KioskScreen.tsx
++++ b/src/screens/KioskScreen.tsx
+@@ -166,6 +166,10 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+ 
+   // WebView reload key - increment to force reload
+   const [webViewKey, setWebViewKey] = useState<number>(0);
++  // #hard-reset — route to restore on the next remount when the operator triple-pressed
++  // refresh, so a hard reset rebuilds the WebView in place instead of sending them home.
++  // null = use the configured `url`.
++  const [hardResetUrl, setHardResetUrl] = useState<string | null>(null);
+   // #198 — guard against a renderer crash-loop: track consecutive renderer-gone
+   // remounts within a short window so a WebView that dies immediately on every
+   // load doesn't get hammered into an infinite tight remount loop.
+@@ -474,6 +478,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+           console.log('[API] Wake');
+         },
+         onReload: () => {
++          setHardResetUrl(null); // #hard-reset: an explicit API reload goes to the configured URL
+           setWebViewKey(prev => prev + 1);
+           console.log('[API] Reload triggered');
+         },
+@@ -549,6 +554,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+           if (webViewRef.current) {
+             webViewRef.current.clearCache();
+           }
++          setHardResetUrl(null); // #hard-reset: an explicit API cache-clear goes to the configured URL
+           setWebViewKey(prev => prev + 1);
+           console.log('[API] Cache cleared (native + WebView remount)');
+         },
+@@ -1959,6 +1965,30 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+     }
+   }, []);
+ 
++  // #hard-reset — the operator triple-pressed refresh and the page finished purging
++  // Service Workers + Cache Storage. A reload() cannot clear what's actually wedged:
++  // it keeps the same native WebView and the same Chromium renderer process, so a
++  // stuck compositor, a camera HAL client still held by that renderer, leaked
++  // getUserMedia streams and a corrupted code-cache all survive it. Bumping
++  // webViewKey destroys the instance and builds a new one with a fresh renderer —
++  // the closest thing to a device restart available without restarting the process.
++  // The operator's current route is preserved (hardResetUrl) rather than sending
++  // them back to the start page.
++  const handleWebViewHardReset = useCallback(() => {
++    const target = currentWebViewUrlRef.current;
++    console.warn(`[KioskScreen] hard reset — remounting WebView at "${target || url}"`);
++    if (target) {
++      setHardResetUrl(target);
++    }
++    setWebViewKey(prev => prev + 1);
++  }, [url]);
++
++  // Any path that deliberately changes the URL (settings, API setUrl, rotation,
++  // planner) supersedes a hard-reset route override.
++  useEffect(() => {
++    setHardResetUrl(null);
++  }, [url]);
++
+   // Single useEffect that manages the inactivity return timer
+   // It re-runs whenever relevant state changes
+   useEffect(() => {
+@@ -2024,6 +2054,10 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+             console.log(`[InactivityReturn] 🔄 RETURNING to start page NOW`);
+             // Always force a full WebView reload — because setUrl alone won't work
+             // when the WebView navigated internally (url state hasn't changed)
++            // #hard-reset: drop any route override explicitly — setUrl(baseUrl) is a
++            // no-op when url is already baseUrl, so the [url] effect wouldn't fire and
++            // a stale override would defeat the whole point of returning home.
++            setHardResetUrl(null);
+             setUrl(baseUrl);
+             setWebViewKey(prev => prev + 1);
+           }
+@@ -2446,7 +2480,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+             <WebViewComponent
+               ref={webViewRef}
+               key={webViewKey}
+-              url={url}
++              url={hardResetUrl ?? url}
+               autoReload={autoReload}
+               keyboardMode={keyboardMode}
+               keepScreenOn={keepScreenOn}
+@@ -2482,6 +2516,7 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+                   : undefined
+               }
+               onRenderProcessGone={handleWebViewRenderProcessGone}
++              onHardReset={handleWebViewHardReset}
+             />
+           )}
+         </>

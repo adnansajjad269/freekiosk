@@ -2,6 +2,35 @@ diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactna
 index 07f73fd..275f2cd 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java
 +++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java
+@@ -114,14 +114,20 @@ public class RNCWebChromeClient extends WebChromeClient implements LifecycleEven
+         return true;
+     }
+ 
+-    @Override
+-    public boolean onConsoleMessage(ConsoleMessage message) {
+-        if (ReactBuildConfig.DEBUG) {
+-            return super.onConsoleMessage(message);
+-        }
+-        // Ignore console logs in non debug builds.
+-        return true;
+-    }
++    @Override
++    public boolean onConsoleMessage(ConsoleMessage message) {
++        // FreeKiosk: upstream discards ALL page console output in non-debug builds
++        // (returns true without forwarding), and FreeKiosk only ships assembleRelease.
++        // That silently disabled every in-page diagnostic ([FreeKioskCam] /
++        // [FreeKioskNet]) - no JS-side change can restore it, because the message
++        // never leaves the WebView. Forward to logcat under a stable tag instead.
++        android.util.Log.i(
++            "FreeKioskWebConsole",
++            message.messageLevel() + " " + message.message()
++                + " (" + message.sourceId() + ":" + message.lineNumber() + ")"
++        );
++        return true;
++    }
+ 
+     @Override
+     public void onProgressChanged(WebView webView, int newProgress) {
 @@ -144,72 +144,32 @@ public class RNCWebChromeClient extends WebChromeClient implements LifecycleEven
  
      @Override
