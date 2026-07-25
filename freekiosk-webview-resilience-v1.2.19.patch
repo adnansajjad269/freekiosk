@@ -1,5 +1,5 @@
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index 6be3b4f..05c4a6d 100644
+index 6be3b4f..4d79f97 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -37,27 +37,49 @@ const WAKE_LOCK_NEUTRALIZE_JS = `
@@ -82,7 +82,7 @@ index 6be3b4f..05c4a6d 100644
        navigator.wakeLock.request = window.__fkWakeOrig;
      }
    } catch(e){}
-@@ -76,33 +99,312 @@ const WAKE_LOCK_RESTORE_JS = `
+@@ -76,33 +99,315 @@ const WAKE_LOCK_RESTORE_JS = `
  true;
  `;
  
@@ -160,7 +160,9 @@ index 6be3b4f..05c4a6d 100644
 +//     NotAllowedError — surfaces to the page unchanged, and a second failure
 +//     surfaces too, so the page's own "Try again" UI remains the fallback.
 +//  2. Log every call/outcome as [FreeKioskCam] (visible via adb logcat,
-+//     ReactNativeJS tag) so field failures name their exact error class.
++//     ReactNativeJS tag, once the onConsoleMessage bridge below re-emits
++//     page-context console output through RN's own console) so field
++//     failures name their exact error class.
 +// If the watchdog fires and the original open later succeeds, the late
 +// stream's tracks are stopped so no live camera is leaked.
 +const CAMERA_RESILIENCE_JS = `
@@ -330,7 +332,8 @@ index 6be3b4f..05c4a6d 100644
 +// is the evidence layer for the reboot-immune infinite-spinner / partial-load
 +// reports: adb logcat | grep FreeKioskNet names the exact endpoint(s) that hang
 +// or fail, distinguishing a backend/network problem from WebView-persisted
-+// state. No retries, no behavior change.
++// state. No retries, no behavior change. Requires the onConsoleMessage bridge
++// below — page-context console output does not reach logcat on its own.
 +const NET_DIAG_JS = `
 +(function(){
 +  try {
@@ -410,7 +413,7 @@ index 6be3b4f..05c4a6d 100644
  interface WebViewComponentProps {
    url: string;
    autoReload: boolean;
-@@ -175,6 +477,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -175,6 +480,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
    }, []);
    const blockedUrlTimerRef = useRef<any>(null);
    const isGoingBackRef = useRef<boolean>(false); // Prevent goBack loop for URL filter
@@ -422,7 +425,7 @@ index 6be3b4f..05c4a6d 100644
    const fadeAnim = useRef(new Animated.Value(0)).current;
    const loadingTimeoutRef = useRef<any>(null);
  
-@@ -616,9 +923,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -616,9 +926,23 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            }
          });
        }
@@ -448,7 +451,7 @@ index 6be3b4f..05c4a6d 100644
        pdfObserver.observe(document.body, { childList: true, subtree: true });
      }
    })();
-@@ -708,7 +1029,37 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -708,7 +1032,37 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      wv.injectJavaScript(wakeLockActive ? WAKE_LOCK_NEUTRALIZE_JS : WAKE_LOCK_RESTORE_JS);
    }, [wakeLockActive]);
  
@@ -487,7 +490,7 @@ index 6be3b4f..05c4a6d 100644
  
    // Gestion des messages venant de la webview
    const onMessageHandler = (event: any) => {
-@@ -821,6 +1172,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -821,6 +1175,35 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
      }
    };
  
@@ -523,17 +526,26 @@ index 6be3b4f..05c4a6d 100644
    const handleReload = (): void => {
      setError(false);
      setLoading(true);
-@@ -980,8 +1360,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -980,8 +1363,16 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
          }}
          onError={handleError}
          onRenderProcessGone={handleRenderProcessGone}
 -        injectedJavaScriptBeforeContentLoaded={CAMERA_DIAG_JS}
 -
++        onConsoleMessage={({ nativeEvent }) => {
++          // #webview-resilience: react-native-webview's WebChromeClient swallows
++          // page-context console output — it never reaches adb logcat on its own,
++          // regardless of tag. Re-emit through RN's own console so the
++          // [FreeKioskCam]/[FreeKioskNet] diagnostic logs (which assume this path
++          // already existed) are actually observable via `adb logcat | grep
++          // FreeKioskCam` (tag ReactNativeJS), in dev and release builds alike.
++          console.log('[FKWebViewConsole/' + nativeEvent.level + '] ' + nativeEvent.message);
++        }}
 +        injectedJavaScriptBeforeContentLoaded={buildWakeGateScript(wakeLockActive) + CAMERA_RESILIENCE_JS + NET_DIAG_JS}
          javaScriptEnabled={true}
          domStorageEnabled={true}
          injectedJavaScript={combinedInjectedJavaScript}
-@@ -1226,7 +1605,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
+@@ -1226,7 +1617,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
            which is unreliable on non-scrolling / inner-scroll SPA pages. */}
        <TouchableOpacity
          style={styles.refreshButton}
