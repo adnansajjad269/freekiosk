@@ -33,6 +33,33 @@ index dd734ec..3964384 100644
      defaultConfig {
          applicationId "com.freekiosk"
          minSdkVersion rootProject.ext.minSdkVersion
+diff --git a/android/app/proguard-rules.pro b/android/app/proguard-rules.pro
+index 6646191..29ad448 100644
+--- a/android/app/proguard-rules.pro
++++ b/android/app/proguard-rules.pro
+@@ -91,3 +91,22 @@
+ -dontwarn net.jpountz.xxhash.**
+ -dontwarn org.jboss.marshalling.**
+ -dontwarn org.osgi.annotation.bundle.Export
++
++# -----------------------------------------------------------------------
++# Vendored Headwind MDM client (com.hmdm.*) — used by ManagedConfigModule to
++# bind to the Headwind launcher's AIDL PluginApiService (IMdmApi) and report
++# config-apply acknowledgements via HeadwindMDM.setCustom().
++#
++# Same failure class as the HiveMQ rules above: this app ships release-only
++# (minifyEnabled unconditionally true), and com.hmdm is compiled as
++# first-party source (not a keep-by-default external AAR), so without an
++# explicit rule R8 is free to rename/merge/devirtualize it like any of our
++# own code. HeadwindMDM.EventHandler is a callback interface with a single
++# implementor visible to R8's whole-program analysis (the anonymous object in
++# ManagedConfigModule) — exactly the shape the HiveMQ comment above describes
++# as prone to R8 merging/devirtualizing into AbstractMethodError /
++# IncompatibleClassChangeError at runtime. IMdmApi.Stub.asInterface() also
++# depends on the AIDL-generated Stub/Proxy class identity for its
++# local-vs-remote Binder check.
++# -----------------------------------------------------------------------
++-keep class com.hmdm.** { *; }
 diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
 index cddfb5a..89bf835 100644
 --- a/android/app/src/main/AndroidManifest.xml
@@ -132,10 +159,10 @@ index a1a693a..26d3205 100644
      )
 diff --git a/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
 new file mode 100644
-index 0000000..1c9d2e2
+index 0000000..2676bf0
 --- /dev/null
 +++ b/android/app/src/main/java/com/freekiosk/ManagedConfigModule.kt
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,328 @@
 +package com.freekiosk
 +
 +import android.content.BroadcastReceiver
@@ -281,7 +308,18 @@ index 0000000..1c9d2e2
 +        val available = try {
 +            // connect() returns false if Headwind MDM isn't present/bindable yet.
 +            HeadwindMDM.getInstance().connect(reactApplicationContext, mdmEventHandler)
-+        } catch (e: Exception) {
++        } catch (e: Throwable) {
++            // Throwable, not Exception: com.hmdm is vendored first-party source with
++            // no ProGuard keep rule until this fix, so a stripped/merged/devirtualized
++            // class here throws NoSuchMethodError/NoClassDefFoundError/
++            // IncompatibleClassChangeError — all java.lang.Error, not Exception, which
++            // an Exception-only catch does not stop. The first call runs synchronously
++            // inside initialize(); an uncaught Error there can take the whole module
++            // (or the app) down before it ever logs anything — which would explain a
++            // report of "nothing at all" from `adb logcat | grep ManagedConfig`, not even
++            // the getConfig() line this module otherwise logs unconditionally on every
++            // launch. Retries run on the main Looper via postDelayed, where an uncaught
++            // Error is fatal to the whole app, not just this module.
 +            Log.w(TAG, "HeadwindMDM.connect() threw: ${e.message}")
 +            false
 +        }
@@ -297,8 +335,16 @@ index 0000000..1c9d2e2
 +        if (!mdmConnected || pendingCustom.isEmpty()) return
 +        val snapshot = HashMap(pendingCustom)
 +        for ((slot, value) in snapshot) {
-+            if (HeadwindMDM.getInstance().setCustom(slot, value)) {
-+                pendingCustom.remove(slot)
++            try {
++                if (HeadwindMDM.getInstance().setCustom(slot, value)) {
++                    pendingCustom.remove(slot)
++                }
++            } catch (e: Throwable) {
++                // Previously unguarded: this runs from onHeadwindMDMConnected(), a
++                // callback invoked by the vendored lib on its own thread — an uncaught
++                // Throwable here had no caller to catch it. Isolated per-slot so one
++                // bad value can't stop the rest of the queue from flushing.
++                Log.w(TAG, "flushPendingCustom slot=$slot failed: ${e.message}")
 +            }
 +        }
 +    }
@@ -329,7 +375,9 @@ index 0000000..1c9d2e2
 +                startMdmConnect()
 +                promise.resolve(false)
 +            }
-+        } catch (e: Exception) {
++        } catch (e: Throwable) {
++            // Throwable: see attemptConnect() for why Exception alone isn't enough
++            // for a com.hmdm call. Promise.reject() has a Throwable overload.
 +            promise.reject("MANAGED_CONFIG_REPORT_ERROR", e)
 +        }
 +    }
@@ -354,7 +402,9 @@ index 0000000..1c9d2e2
 +                "VERBOSE" -> MDMService.Log.v(TAG, message)
 +                else -> MDMService.Log.i(TAG, message)
 +            }
-+        } catch (e: Exception) {
++        } catch (e: Throwable) {
++            // Throwable: see attemptConnect() for why Exception alone isn't enough
++            // for a com.hmdm call.
 +            Log.w(TAG, "logRemote failed: ${e.message}")
 +        }
 +    }
@@ -1553,7 +1603,7 @@ index 0000000..2267cab
 +  }, []);
 +}
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index 6a6a3c2..7d1d35e 100644
+index 74550a5..2c85372 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
 @@ -29,6 +29,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
