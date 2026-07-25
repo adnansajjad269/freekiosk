@@ -1633,10 +1633,10 @@ index 74550a5..2c85372 100644
      // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..86272be
+index 0000000..78b903c
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,725 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1659,9 +1659,15 @@ index 0000000..86272be
 + *      arrays). The sentinel ["__CLEAR__"] means "set this list to empty".
 + *   3. kiosk_pin is a top-level, ungated, normalized, separately-acked entry —
 + *      applied on every emission regardless of config_version (per-device PIN
-+ *      pushes don't bump the fleet version). See applyPin(). return_tap_count
-+ *      is the same: ungated, applied on every emission, acked to its own
-+ *      custom slot (3). See applyReturnTapCount().
++ *      pushes don't bump the fleet version). See applyPin().
++ *      return_tap_count is DUAL-MODE, decided per push by whether THAT push
++ *      carries a config_version: absent → ungated, same as kiosk_pin (applied
++ *      immediately if changed, acked to custom slot 3, see
++ *      applyReturnTapCount()); present → travels with the bulk fields instead,
++ *      as a normal (gated) NUMBER_FIELDS entry, subject to the same
++ *      version-gating/diffing/ack as everything else in convention 6-7. Since
++ *      it can change out-of-band via its own ungated path, it's excluded from
++ *      the fingerprint in convention 7 for the same reason kiosk_pin is.
 + *   4. Object-array fields arrive as arrays of plain objects (native converts
 + *      the launcher's Parcelable[] of Bundles); they are passed straight to the
 + *      setters, which persist them as JSON.
@@ -1891,6 +1897,11 @@ index 0000000..86272be
 +};
 +
 +const NUMBER_FIELDS: FieldTable<number> = {
++  // Dual-mode (see applyManagedConfig): only reached when THIS push carries a
++  // config_version — applyManagedConfig() skips the ungated applyReturnTapCount()
++  // call in that case, so this table entry is what actually applies it, subject
++  // to the same version-gating/diffing as every other bulk field below.
++  return_tap_count: { get: StorageService.getReturnTapCount, set: StorageService.saveReturnTapCount },
 +  pin_max_attempts: { get: StorageService.getPinMaxAttempts, set: StorageService.savePinMaxAttempts },
 +  back_button_timer_delay: { get: StorageService.getBackButtonTimerDelay, set: StorageService.saveBackButtonTimerDelay },
 +  url_rotation_interval: { get: StorageService.getUrlRotationInterval, set: StorageService.saveUrlRotationInterval },
@@ -1935,13 +1946,14 @@ index 0000000..86272be
 +// ---- push-shape helpers (conventions 7-8) -----------------------------------
 +
 +// Keys that are legitimate at the top level of the restrictions bundle but are
-+// not settings fields themselves.
++// not settings fields themselves. return_tap_count is NOT here — dual-mode
++// (see applyManagedConfig), it's a real NUMBER_FIELDS entry for the gated
++// case, so KNOWN_FIELD_KEYS already covers its legitimacy there.
 +const RESERVED_KEYS = new Set([
 +  'config_version',
 +  'config_fields',
 +  'kiosk_pin',
 +  'kiosk_pin_label',
-+  'return_tap_count',
 +]);
 +
 +const KNOWN_FIELD_KEYS = new Set([
@@ -1952,13 +1964,19 @@ index 0000000..86272be
 +]);
 +
 +/**
-+ * Stable fingerprint of the config payload (sorted keys, PIN siblings
-+ * excluded — a per-device PIN rotation legitimately changes the bundle
-+ * without a config_version bump and must not look like an unbumped edit).
++ * Stable fingerprint of the config payload (sorted keys, PIN siblings and
++ * return_tap_count excluded — each can legitimately change the bundle without
++ * a config_version bump via its own ungated path, and must not make an
++ * unrelated, unchanged bulk config look like an unbumped edit. Android
++ * redelivers the FULL current restrictions bundle on every change, so an
++ * ungated return_tap_count push always arrives alongside whatever
++ * config_version is currently active — without this exclusion, that
++ * redelivery would trip the "payload changed but version not bumped" error
++ * below for fields that never actually changed).
 + */
 +function computeFingerprint(restrictions: Record<string, unknown>): string {
 +  const keys = Object.keys(restrictions)
-+    .filter((k) => k !== 'kiosk_pin' && k !== 'kiosk_pin_label')
++    .filter((k) => k !== 'kiosk_pin' && k !== 'kiosk_pin_label' && k !== 'return_tap_count')
 +    .sort();
 +  const obj: Record<string, unknown> = {};
 +  for (const k of keys) obj[k] = restrictions[k];
@@ -2042,9 +2060,12 @@ index 0000000..86272be
 +}
 +
 +/**
-+ * return_tap_count — the second top-level, ungated, separately-acked entry
-+ * (see applyPin() above). Pushable standalone with no config_version, so an
-+ * admin can nudge this one counter without touching the fleet version.
++ * return_tap_count's ungated path (see applyPin() above for the same pattern
++ * with kiosk_pin). Only called by applyManagedConfig() when THIS push carries
++ * no config_version — an admin can nudge this one counter without touching
++ * the fleet version. A push that DOES carry a config_version instead applies
++ * return_tap_count through the bulk NUMBER_FIELDS table (this function isn't
++ * called for that case at all — see applyManagedConfig()).
 + * Returns true only if the value was actually changed.
 + */
 +export async function applyReturnTapCount(
@@ -2178,7 +2199,13 @@ index 0000000..86272be
 +export interface ApplyResult {
 +  /** PIN was changed (never triggers a reload). */
 +  pinChanged: boolean;
-+  /** return_tap_count was changed (never triggers a reload). */
++  /**
++   * return_tap_count was changed via the UNGATED path only (see
++   * applyReturnTapCount) — set only for a push with no config_version. A
++   * gated push that changes return_tap_count reports it through bulkApplied
++   * instead, since it's now a normal NUMBER_FIELDS entry for that case. Both
++   * trigger a reload in useManagedConfigSync — see its handleReload.
++   */
 +  returnTapCountChanged: boolean;
 +  /** At least one bulk field was actually written (triggers a live reload). */
 +  bulkApplied: boolean;
@@ -2205,32 +2232,41 @@ index 0000000..86272be
 +  }
 +  console.log('[ManagedConfig] restrictions received, keys=', Object.keys(restrictions));
 +
-+  // 1. PIN — ungated, every emission (top-level kiosk_pin).
++  // 1. PIN — ungated, every emission (top-level kiosk_pin), always — unlike
++  // return_tap_count below, kiosk_pin has no gated/bulk mode.
 +  try {
 +    result.pinChanged = await applyPin(restrictions, native);
 +  } catch (e) {
 +    console.warn('[ManagedConfig] applyPin failed:', e);
 +  }
 +
-+  // 1b. return_tap_count — also ungated, every emission (top-level return_tap_count).
-+  try {
-+    result.returnTapCountChanged = await applyReturnTapCount(restrictions, native);
-+  } catch (e) {
-+    console.warn('[ManagedConfig] applyReturnTapCount failed:', e);
-+  }
-+
-+  // 2 + 3. Bulk config, gated on config_version — read from the TOP LEVEL of
-+  // the (flattened) restrictions bundle, not a nested object.
++  // config_version determines return_tap_count's mode below, so it's read
++  // here rather than down with the rest of the bulk-config handling.
 +  const incomingVersion =
 +    restrictions.config_version !== undefined && restrictions.config_version !== null
 +      ? String(restrictions.config_version)
 +      : undefined;
 +
++  // 1b. return_tap_count — dual-mode. THIS push carrying no config_version
++  // means it's a one-off/ungated update (PIN-style): apply immediately if
++  // changed, ack to custom3, independent of any bulk config state. THIS push
++  // carrying a config_version means return_tap_count instead travels with the
++  // bulk fields below as a normal NUMBER_FIELDS entry — same version-gating,
++  // diffing, and "Config #N Applied/Skipped" accounting as every other bulk
++  // field (see the NUMBER_FIELDS table), same as before #20117ed. Whichever
++  // mode a given push uses, applyReturnTapCount() only runs for the former.
 +  if (incomingVersion === undefined) {
-+    console.log('[ManagedConfig] no config_version present; skipping bulk apply (PIN-only or empty push)');
++    try {
++      result.returnTapCountChanged = await applyReturnTapCount(restrictions, native);
++    } catch (e) {
++      console.warn('[ManagedConfig] applyReturnTapCount failed:', e);
++    }
++    console.log('[ManagedConfig] no config_version present; skipping bulk apply (ungated-only push)');
 +    return result;
 +  }
 +
++  // 2 + 3. Bulk config, gated on config_version — read from the TOP LEVEL of
++  // the (flattened) restrictions bundle, not a nested object.
 +  const lastVersion = await StorageService.getManagedConfigVersion();
 +  console.log(`[ManagedConfig] config_version incoming=${incomingVersion} last=${lastVersion ?? '(none)'}`);
 +
