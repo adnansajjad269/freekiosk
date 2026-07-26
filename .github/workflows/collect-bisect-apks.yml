@@ -4,20 +4,14 @@ name: Collect bisection APKs into git
 # (server-side, via actions/download-artifact's cross-run run-id support)
 # and commits the raw APKs to a branch, since Actions artifacts are only
 # reachable via signed Azure Blob Storage URLs that some network policies
-# block. Trigger manually from the Actions tab with the 3 run IDs.
+# block. Triggered by push-to-self (workflow_dispatch would need this file
+# on the default branch first to register as dispatchable) — run IDs are
+# hardcoded since push events carry no inputs. Delete this file once done.
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_id_1:
-        description: "Workflow run ID for checkpoint 1"
-        required: true
-      run_id_2:
-        description: "Workflow run ID for checkpoint 2"
-        required: true
-      run_id_3:
-        description: "Workflow run ID for checkpoint 3"
-        required: true
+  push:
+    paths:
+      - ".github/workflows/collect-bisect-apks.yml"
 
 permissions:
   contents: write
@@ -33,7 +27,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: FreeKiosk-battlock-apk
-          run-id: ${{ github.event.inputs.run_id_1 }}
+          run-id: "30199204061"
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: collected/checkpoint1
 
@@ -41,7 +35,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: FreeKiosk-battlock-apk
-          run-id: ${{ github.event.inputs.run_id_2 }}
+          run-id: "30199204816"
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: collected/checkpoint2
 
@@ -49,7 +43,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: FreeKiosk-battlock-apk
-          run-id: ${{ github.event.inputs.run_id_3 }}
+          run-id: "30199205410"
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: collected/checkpoint3
 
