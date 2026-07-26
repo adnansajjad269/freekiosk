@@ -137,7 +137,7 @@ index c8e31a4..924d926 100644
          }
  
 diff --git a/src/components/MotionDetector.tsx b/src/components/MotionDetector.tsx
-index a295e0f..70e70f2 100644
+index a295e0f..30e1a35 100644
 --- a/src/components/MotionDetector.tsx
 +++ b/src/components/MotionDetector.tsx
 @@ -1,6 +1,7 @@
@@ -149,20 +149,19 @@ index a295e0f..70e70f2 100644
  import MotionDetectionModule from '../utils/MotionDetectionModule';
  import { httpServer } from '../utils/HttpServerModule';
  
-@@ -34,6 +35,21 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+@@ -34,11 +35,30 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
    cameraPosition = 'front',
    onStatusChange,
  }) => {
 +  // #camera-teardown: require vision-camera lazily, inside the component body.
 +  // A static import initializes the native CameraDevicesManager the moment the
 +  // JS module evaluates — it registers a CameraManager availability callback and
-+  // enumerates every camera with full characteristics, a permanent same-process
-+  // camera-service hook that exists even when motion detection is disabled. On
-+  // legacy HALs (Kyocera DuraForce2 / Android 10) that dormant hook can interfere
-+  // with the WebView's getUserMedia. KioskScreen only mounts this component when
-+  // the motion feature is enabled, so with motion off the app now makes zero
-+  // camera-service calls. require() is cached, so the destructured hooks keep
-+  // stable identities across renders and the rules of hooks hold.
++  // enumerates every camera with full characteristics. KioskScreen mounts this
++  // component unconditionally (field-confirmed: on this device's HAL, that init
++  // side effect is what the WebView's own getUserMedia decode reliability
++  // depends on — see the mount site in KioskScreen.tsx for the full story), so
++  // this require() always runs; kept lazy regardless, since require() is cached
++  // and the destructured hooks keep stable identities across renders either way.
 +  const {
 +    Camera: VisionCamera,
 +    useCameraDevice,
@@ -171,7 +170,48 @@ index a295e0f..70e70f2 100644
    const device = useCameraDevice(cameraPosition);
    const { hasPermission } = useCameraPermission();
    const cameraRef = useRef<Camera>(null);
-@@ -372,7 +388,7 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+   const lastMotionTime = useRef<number>(0);
+   const detectionInterval = useRef<ReturnType<typeof setInterval> | null>(null);
++  // #198 — pending CAMERA_READY_DELAY startup timer. Tracked so stopDetection() can
++  // cancel it; otherwise a disable/restart within the delay window leaves it pending
++  // and it fires later with a stale `enabled` closure, arming an orphaned interval
++  // stopDetection() can never reach (see stopDetection/startDetection below).
++  const startDelayTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const isMounted = useRef<boolean>(true);
+   const isCapturing = useRef<boolean>(false);
+   const warmupFrames = useRef<number>(0);
+@@ -105,6 +125,10 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+   }, [device]);
+ 
+   const stopDetection = useCallback(() => {
++    if (startDelayTimeout.current) {
++      clearTimeout(startDelayTimeout.current);
++      startDelayTimeout.current = null;
++    }
+     if (detectionInterval.current) {
+       clearInterval(detectionInterval.current);
+       detectionInterval.current = null;
+@@ -266,7 +290,8 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+     onStatusChange?.('active');
+ 
+     // Slightly longer delay for Camera2 — first capture includes camera open time
+-    setTimeout(() => {
++    startDelayTimeout.current = setTimeout(() => {
++      startDelayTimeout.current = null;
+       if (!isMounted.current || !enabled) return;
+ 
+       detectionInterval.current = setInterval(() => {
+@@ -281,7 +306,8 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
+     stopDetection();
+ 
+     // Add a small delay to ensure camera is fully initialized
+-    setTimeout(() => {
++    startDelayTimeout.current = setTimeout(() => {
++      startDelayTimeout.current = null;
+       if (!isMounted.current || !enabled) return;
+ 
+       detectionInterval.current = setInterval(() => {
+@@ -372,7 +398,7 @@ const MotionDetector: React.FC<MotionDetectorProps> = ({
  
    return (
      <View style={styles.container} pointerEvents="none">
@@ -181,7 +221,7 @@ index a295e0f..70e70f2 100644
          style={styles.camera}
          device={device}
 diff --git a/src/components/WebViewComponent.tsx b/src/components/WebViewComponent.tsx
-index bff66d8..102bbb3 100644
+index e6f957d..6be3b4f 100644
 --- a/src/components/WebViewComponent.tsx
 +++ b/src/components/WebViewComponent.tsx
 @@ -76,6 +76,33 @@ const WAKE_LOCK_RESTORE_JS = `
@@ -227,10 +267,10 @@ index bff66d8..102bbb3 100644
          javaScriptEnabled={true}
          domStorageEnabled={true}
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index 12cdcb7..93a735a 100644
+index 74fc3af..9ffef37 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
-@@ -2537,7 +2537,22 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -2548,7 +2548,22 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
          />
        )}
  
