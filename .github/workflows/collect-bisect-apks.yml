@@ -1,0 +1,69 @@
+name: Collect bisection APKs into git
+
+# One-off helper: pulls already-built artifacts from other workflow runs
+# (server-side, via actions/download-artifact's cross-run run-id support)
+# and commits the raw APKs to a branch, since Actions artifacts are only
+# reachable via signed Azure Blob Storage URLs that some network policies
+# block. Trigger manually from the Actions tab with the 3 run IDs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id_1:
+        description: "Workflow run ID for checkpoint 1"
+        required: true
+      run_id_2:
+        description: "Workflow run ID for checkpoint 2"
+        required: true
+      run_id_3:
+        description: "Workflow run ID for checkpoint 3"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download checkpoint 1 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: FreeKiosk-battlock-apk
+          run-id: ${{ github.event.inputs.run_id_1 }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: collected/checkpoint1
+
+      - name: Download checkpoint 2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: FreeKiosk-battlock-apk
+          run-id: ${{ github.event.inputs.run_id_2 }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: collected/checkpoint2
+
+      - name: Download checkpoint 3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: FreeKiosk-battlock-apk
+          run-id: ${{ github.event.inputs.run_id_3 }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: collected/checkpoint3
+
+      - name: Collect APKs and commit to a branch
+        run: |
+          set -euo pipefail
+          mkdir -p bisect-apks
+          find collected/checkpoint1 -name "*.apk" -exec cp {} bisect-apks/checkpoint1-wakelock-only-v1.2.31.apk \;
+          find collected/checkpoint2 -name "*.apk" -exec cp {} bisect-apks/checkpoint2-camera-teardown-v1.2.33.apk \;
+          find collected/checkpoint3 -name "*.apk" -exec cp {} bisect-apks/checkpoint3-resilience-loop-v1.2.40.apk \;
+          ls -la bisect-apks/
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B bisect/apks-collected
+          git add -f bisect-apks/
+          git commit -m "Collect bisection checkpoint APKs for retrieval"
+          git push -f origin bisect/apks-collected
