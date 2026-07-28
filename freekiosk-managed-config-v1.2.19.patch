@@ -1522,10 +1522,10 @@ index 0000000..ff12a7c
 +}
 diff --git a/src/hooks/useManagedConfigSync.ts b/src/hooks/useManagedConfigSync.ts
 new file mode 100644
-index 0000000..2267cab
+index 0000000..81606ff
 --- /dev/null
 +++ b/src/hooks/useManagedConfigSync.ts
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,92 @@
 +import { useEffect } from 'react';
 +import { NativeModules, NativeEventEmitter } from 'react-native';
 +import { applyManagedConfig, ApplyResult, ManagedConfigNative } from '../utils/applyManagedConfig';
@@ -1563,6 +1563,20 @@ index 0000000..2267cab
 +
 +    let mounted = true;
 +    const emitter = new NativeEventEmitter(ManagedConfig as any);
++    // Bug fix: apply() previously ran as a bare, unserialized call from both
++    // triggers below. The native side fires managedConfigChanged from two
++    // independent listeners for the same underlying change (system broadcast
++    // + HeadwindMDM.EventHandler — intentionally redundant, see
++    // ManagedConfigModule.kt), so both can land within milliseconds of each
++    // other. Unserialized, both calls read the last-applied version/fingerprint
++    // before either had written its own, so both passed the version gate — the
++    // second call's per-field diff then saw the FIRST call's just-written
++    // value and logged it as "already matched" too, producing a duplicate
++    // WARNING with one extra field. Chaining through a shared promise ensures
++    // a queued call only starts once the previous one has fully persisted its
++    // version + fingerprint, so a genuine duplicate delivery correctly lands
++    // in applyManagedConfig()'s own "routine re-delivery" branch instead.
++    let applyChain: Promise<void> = Promise.resolve();
 +
 +    const handleReload = (result: ApplyResult) => {
 +      // bulkApplied: any gated field actually wrote. returnTapCountChanged: unlike
@@ -1575,13 +1589,15 @@ index 0000000..2267cab
 +      kioskScreenActionsRef.current?.reloadSettings();
 +    };
 +
-+    const apply = async (restrictions: Record<string, unknown>) => {
-+      try {
-+        const result = await applyManagedConfig(restrictions, ManagedConfig);
-+        if (mounted) handleReload(result);
-+      } catch (e) {
-+        console.warn('[ManagedConfig] apply failed:', e);
-+      }
++    const apply = (restrictions: Record<string, unknown>) => {
++      applyChain = applyChain.then(async () => {
++        try {
++          const result = await applyManagedConfig(restrictions, ManagedConfig);
++          if (mounted) handleReload(result);
++        } catch (e) {
++          console.warn('[ManagedConfig] apply failed:', e);
++        }
++      });
 +    };
 +
 +    ManagedConfig.getConfig()
@@ -1603,7 +1619,7 @@ index 0000000..2267cab
 +  }, []);
 +}
 diff --git a/src/screens/KioskScreen.tsx b/src/screens/KioskScreen.tsx
-index 74550a5..2c85372 100644
+index 8d3c910..28eb1be 100644
 --- a/src/screens/KioskScreen.tsx
 +++ b/src/screens/KioskScreen.tsx
 @@ -29,6 +29,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -1614,7 +1630,7 @@ index 74550a5..2c85372 100644
  import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
  
  const { HttpServerModule } = NativeModules;
-@@ -1886,6 +1887,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
+@@ -1876,6 +1877,16 @@ const KioskScreen: React.FC<KioskScreenProps> = ({ navigation }) => {
      }
    };
  
@@ -1633,10 +1649,10 @@ index 74550a5..2c85372 100644
      // Don't start inactivity timer if screen is in scheduled sleep
 diff --git a/src/utils/applyManagedConfig.ts b/src/utils/applyManagedConfig.ts
 new file mode 100644
-index 0000000..78b903c
+index 0000000..4e9aefe
 --- /dev/null
 +++ b/src/utils/applyManagedConfig.ts
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,741 @@
 +/**
 + * applyManagedConfig — applies a Headwind MDM managed-configuration payload
 + * (Android App Restrictions) onto FreeKiosk's local settings.
@@ -1692,6 +1708,14 @@ index 0000000..78b903c
 + *      expected field names) lets the device detect fields that were dropped
 + *      upstream by the launcher parser bugs and report them as errors too.
 + *      Both are non-blocking — valid fields in the same push still apply.
++ *   9. config_version "0" is a repeatable bypass sentinel: it skips both
++ *      convention-7 gate checks (same-version/fingerprint and regression) and
++ *      applies immediately, but is never persisted as the last-applied
++ *      version or fingerprint — so it never disturbs the normal ratchet for
++ *      whatever real version was last applied. Each field is still
++ *      individually diffed per convention 6, so an unchanged field is still
++ *      just skipped, not force-rewritten. Use for "apply this one push right
++ *      now" without bumping the fleet config_version.
 + */
 +
 +import { StorageService } from './storage';
@@ -2247,6 +2271,10 @@ index 0000000..78b903c
 +      ? String(restrictions.config_version)
 +      : undefined;
 +
++  // Convention 9: "0" is a repeatable bypass sentinel, not a real version —
++  // see the doc comment at the top of this file.
++  const isBypassVersion = incomingVersion === '0';
++
 +  // 1b. return_tap_count — dual-mode. THIS push carrying no config_version
 +  // means it's a one-off/ungated update (PIN-style): apply immediately if
 +  // changed, ack to custom3, independent of any bulk config state. THIS push
@@ -2272,31 +2300,33 @@ index 0000000..78b903c
 +
 +  const fingerprint = computeFingerprint(restrictions);
 +
-+  // Convention 7a: same version — routine re-delivery vs unbumped edit.
-+  if (incomingVersion === lastVersion) {
-+    const lastFingerprint = await StorageService.getManagedConfigFingerprint();
-+    if (lastFingerprint !== null && lastFingerprint !== fingerprint) {
++  if (!isBypassVersion) {
++    // Convention 7a: same version — routine re-delivery vs unbumped edit.
++    if (incomingVersion === lastVersion) {
++      const lastFingerprint = await StorageService.getManagedConfigFingerprint();
++      if (lastFingerprint !== null && lastFingerprint !== fingerprint) {
++        logError(
++          native,
++          `config #${incomingVersion} rejected — payload content changed but config_version was not bumped (still ${incomingVersion}). Increment config_version for these changes to apply.`,
++        );
++        await reportConfigAck(native, incomingVersion, 'Error');
++      } else {
++        console.log('[ManagedConfig] config_version unchanged; skipping bulk apply (routine re-delivery)');
++      }
++      return result;
++    }
++
++    // Convention 7b: numeric version regression.
++    const incomingNum = Number(incomingVersion);
++    const lastNum = lastVersion !== null ? Number(lastVersion) : NaN;
++    if (Number.isFinite(incomingNum) && Number.isFinite(lastNum) && incomingNum < lastNum) {
 +      logError(
 +        native,
-+        `config #${incomingVersion} rejected — payload content changed but config_version was not bumped (still ${incomingVersion}). Increment config_version for these changes to apply.`,
++        `config #${incomingVersion} rejected — version regression (incoming ${incomingVersion} is lower than last applied ${lastVersion}). Use a config_version higher than ${lastVersion}.`,
 +      );
 +      await reportConfigAck(native, incomingVersion, 'Error');
-+    } else {
-+      console.log('[ManagedConfig] config_version unchanged; skipping bulk apply (routine re-delivery)');
++      return result;
 +    }
-+    return result;
-+  }
-+
-+  // Convention 7b: numeric version regression.
-+  const incomingNum = Number(incomingVersion);
-+  const lastNum = lastVersion !== null ? Number(lastVersion) : NaN;
-+  if (Number.isFinite(incomingNum) && Number.isFinite(lastNum) && incomingNum < lastNum) {
-+    logError(
-+      native,
-+      `config #${incomingVersion} rejected — version regression (incoming ${incomingVersion} is lower than last applied ${lastVersion}). Use a config_version higher than ${lastVersion}.`,
-+    );
-+    await reportConfigAck(native, incomingVersion, 'Error');
-+    return result;
 +  }
 +
 +  // Convention 8: push-shape validation — unknown keys and the optional
@@ -2328,8 +2358,10 @@ index 0000000..78b903c
 +  }
 +
 +  const bulkResult = await applyBulk(restrictions);
-+  await StorageService.saveManagedConfigVersion(incomingVersion);
-+  await StorageService.saveManagedConfigFingerprint(fingerprint);
++  if (!isBypassVersion) {
++    await StorageService.saveManagedConfigVersion(incomingVersion);
++    await StorageService.saveManagedConfigFingerprint(fingerprint);
++  }
 +  result.bulkApplied = bulkResult.applied.length > 0;
 +
 +  const status: 'Success' | 'Error' =
