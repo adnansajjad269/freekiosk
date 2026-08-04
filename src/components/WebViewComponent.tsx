@@ -90,6 +90,11 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
 }, ref) => {
   const navigation = useNavigation<NavigationProp>();
   const webViewRef = useRef<WebView>(null);
+  // #190 — Host-view ref for pauseMedia/resumeMedia. react-native-webview's ref is a
+  // methods-only imperative handle, NOT a ReactComponent: passing it to findNodeHandle
+  // throws and crashes the app (JavascriptException on screensaver activation). The
+  // native pauseWebView() walks the subtree for the WebView, so the container's tag works.
+  const containerViewRef = useRef<View>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<boolean>(false);
   const [pageLoaded, setPageLoaded] = useState<boolean>(false);
@@ -217,20 +222,26 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
       const wv = webViewRef.current;
       if (!wv) return;
       wv.injectJavaScript(MEDIA_PAUSE_JS);
-      const node = findNodeHandle(wv);
-      if (node != null) {
-        KioskModule.pauseWebView?.(node).catch(() => {});
-      }
+      // #190 — resolve the tag from the container host view, never from the WebView ref
+      // (a methods-only imperative handle that makes findNodeHandle throw → app crash)
+      try {
+        const node = findNodeHandle(containerViewRef.current);
+        if (node != null) {
+          KioskModule.pauseWebView?.(node).catch(() => {});
+        }
+      } catch {}
     },
     // Resume only re-enables the WebView renderer; media is intentionally left paused so
     // audio doesn't auto-restart on its own (the page/user decides).
     resumeMedia: () => {
       const wv = webViewRef.current;
       if (!wv) return;
-      const node = findNodeHandle(wv);
-      if (node != null) {
-        KioskModule.resumeWebView?.(node).catch(() => {});
-      }
+      try {
+        const node = findNodeHandle(containerViewRef.current);
+        if (node != null) {
+          KioskModule.resumeWebView?.(node).catch(() => {});
+        }
+      } catch {}
     }
   }));
 
@@ -921,7 +932,7 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
   }
 
   return (
-    <View style={styles.container}>
+    <View style={styles.container} ref={containerViewRef}>
       <WebView
         ref={webViewRef}
         source={{ uri: error ? 'about:blank' : url }}
