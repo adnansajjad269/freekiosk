@@ -8,6 +8,10 @@ FreeKiosk is a free, open-source Android kiosk platform built with React Native 
 
 Key capabilities: WebView kiosk, external app launcher, dashboard, media player, 40+ REST API endpoints, MQTT/Home Assistant integration, Device Owner mode, ADB provisioning.
 
+## Start here
+
+Read `docs/HANDOFF.md` first — it has the current state of in-progress fleet investigations, what's been ruled out, and what's next.
+
 ## Commands
 
 ```bash
